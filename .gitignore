@@ -1,0 +1,6 @@
+.state/
+.translate_v3_state/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store

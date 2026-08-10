@@ -1,0 +1,40 @@
+# v3 translate config — everything optional; positional args + defaults cover
+# the common case. Use this for non-Maven layouts, model overrides, etc.
+
+[source]
+# language = "java"                            # default
+# sources_glob = "src/main/java/**/*.java"     # override for non-Maven
+# tests_glob = "src/test/java/**/*.java"
+# resources_glob = "src/main/resources/**/*"
+
+[target]
+# language = "elixir"                          # default
+# app_name = "my_app"                          # default: derived by `mix new`
+# module_name = "MyApp"                        # default: derived by `mix new`
+
+[target.mix_deps]
+decimal = "~> 2.0"
+
+[target.dev_deps]
+credo = "~> 1.7"
+
+[agent]
+model = "claude-opus-4-7"
+model_version_policy = "pinned"
+effort = "high"
+max_budget_tokens = 3_000_000
+max_tool_calls = 500
+max_wall_seconds = 5400
+
+[phases]
+translate = true
+generate_tests = false
+
+[validation]
+run_format = true
+run_credo = true
+credo_block_severity = "high"
+run_tests = false
+
+[safety]
+task_budget_beta = true
