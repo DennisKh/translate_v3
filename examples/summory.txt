@@ -1,0 +1,22 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  RUN SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Wall time:        4m 33s
+  Total cost:       $1.48 USD
+    input           $1.21  (404,830 tokens)
+    output          $0.18  (12,228 tokens)
+    cache_write     $0.03  (7,408 tokens)
+    cache_read      $0.06  (185,200 tokens)
+  Cache hit rate:   31.4%
+  Sessions:         2
+  Budget used:      12%  ($1.48 / $12.50)
+
+  Files translated:  22
+  Files skipped:     0
+  Files escalated:   0
+  Blocked downstream:0
+  Validation:  compile ✗  format ✓  credo ✗
+
+  State: /private/var/www/training/java-string-similarity-v3/.translate_v3_state
+  Exit code: 0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

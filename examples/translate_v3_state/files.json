@@ -1,0 +1,28 @@
+{
+  "files": {
+    "FastUUID": {
+      "stem": "FastUUID",
+      "java_path": "src/main/java/com/eatthepath/uuid/FastUUID.java",
+      "lib_path": "lib/fast_uuid/fast_uuid.ex",
+      "test_path": "test/fast_uuid/fast_uuid_test.exs",
+      "module_name": "FastUuid.FastUUID",
+      "deps": [],
+      "level": 0,
+      "state": "complete",
+      "note": "compile clean at lib/fast_uuid/fast_uuid.ex",
+      "blocked_by": []
+    },
+    "package-info": {
+      "stem": "package-info",
+      "java_path": "src/main/java/com/eatthepath/uuid/package-info.java",
+      "lib_path": "lib/fast_uuid/package-info.ex",
+      "test_path": "test/fast_uuid/package-info_test.exs",
+      "module_name": "FastUuid.package-info",
+      "deps": [],
+      "level": 0,
+      "state": "skipped",
+      "note": "Java package-info.java is a package-level annotation/javadoc file with no Elixir counterpart.",
+      "blocked_by": []
+    }
+  }
+}

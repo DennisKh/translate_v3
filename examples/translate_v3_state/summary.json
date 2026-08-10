@@ -1,0 +1,51 @@
+{
+  "ended_at": "2026-08-08T13:31:31.052+00:00",
+  "wall_seconds": 242,
+  "model": "claude-sonnet-4-6",
+  "cost": {
+    "total_usd": 0.3786,
+    "by_category": {
+      "input_usd": 0.1359,
+      "output_usd": 0.1981,
+      "cache_write_usd": 0.0334,
+      "cache_read_usd": 0.0111
+    }
+  },
+  "tokens": {
+    "input": 45300,
+    "output": 13208,
+    "cache_write": 8916,
+    "cache_read": 37040
+  },
+  "cache_hit_rate": 0.4498,
+  "sessions": 1,
+  "budget": {
+    "used_usd": 0.38,
+    "limit_usd": 5.0,
+    "used_pct": 7.57,
+    "used_tokens": 104464,
+    "limit_tokens": 200000
+  },
+  "files": {
+    "translated": [
+      "FastUUID"
+    ],
+    "translated_count": 1,
+    "skipped": [
+      {
+        "stem": "package-info",
+        "reason": "Java package-info.java is a package-level annotation/javadoc file with no Elixir counterpart.",
+        "kind": "skipped"
+      }
+    ],
+    "escalated": [],
+    "blocked": []
+  },
+  "validation": {
+    "compile": true,
+    "format": true,
+    "credo": true
+  },
+  "regression": {},
+  "exit_code": 0
+}

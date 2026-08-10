@@ -1,0 +1,54 @@
+{
+  "model": "claude-sonnet-4-6",
+  "totals": {
+    "tokens_in": 45300,
+    "tokens_out": 13208,
+    "cache_write": 8916,
+    "cache_read": 37040,
+    "cost_usd": 0.3786,
+    "wall_seconds": 242,
+    "total_tool_calls": 5
+  },
+  "by_file": {
+    "__readme__": {
+      "tokens_in": 4031,
+      "tokens_out": 1786,
+      "cache_read": 0,
+      "cost_usd": 0.0389,
+      "tool_calls": 0
+    },
+    "__test_FastUUIDTest__": {
+      "tokens_in": 1196,
+      "tokens_out": 7179,
+      "cache_read": 0,
+      "cost_usd": 0.1169,
+      "tool_calls": 0
+    }
+  },
+  "by_tool": {
+    "edit_elixir": {
+      "calls": 0,
+      "total_ms": 0
+    },
+    "list_files": {
+      "calls": 1,
+      "total_ms": 0
+    },
+    "read_java": {
+      "calls": 1,
+      "total_ms": 0
+    },
+    "write_elixir": {
+      "calls": 1,
+      "total_ms": 0
+    },
+    "delete_elixir": {
+      "calls": 1,
+      "total_ms": 0
+    },
+    "validation_status": {
+      "calls": 1,
+      "total_ms": 3336
+    }
+  }
+}
