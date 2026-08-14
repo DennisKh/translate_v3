@@ -21,7 +21,7 @@ def test_defaults_only(tmp_path):
     assert cfg.target.root == Path("/tgt")
     assert cfg.source.language == "java"
     assert cfg.target.language == "elixir"
-    assert cfg.agent.model == "claude-opus-4-7"
+    assert cfg.llm.model == "claude-opus-4-7"
     # Default effort is `medium` — chosen after testing showed `high` on
     # Sonnet 4.6 with adaptive thinking caused 30-min single-turn hangs on
     # the hardest files without commensurate output value.
@@ -47,8 +47,10 @@ root = "/wrong/tgt"
 
 def test_cli_overrides_toml(tmp_path):
     toml = _write_toml(tmp_path, """
-[agent]
+[llm]
 model = "claude-sonnet-4-6"
+
+[agent]
 max_budget_tokens = 500_000
 """)
     cfg, _ = build_config(
@@ -57,14 +59,13 @@ max_budget_tokens = 500_000
         model="claude-haiku-4-5",           # CLI wins
         max_budget_tokens=100_000,          # CLI wins
     )
-    assert cfg.agent.model == "claude-haiku-4-5"
+    assert cfg.llm.model == "claude-haiku-4-5"
     assert cfg.agent.max_budget_tokens == 100_000
 
 
 def test_unknown_key_produces_warning(tmp_path):
     toml = _write_toml(tmp_path, """
 [agent]
-model = "claude-opus-4-7"
 totally_made_up_key = "hi"
 """)
     _, warnings = build_config(

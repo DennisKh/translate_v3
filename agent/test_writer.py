@@ -20,9 +20,10 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-import anthropic
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from agent.cost import TurnUsage
+from agent.llm import ChatModelBundle, _extract_text_from_ai_message, apply_prompt_cache, turn_usage_from_ai_message
 from agent.mix_ops import mix_test
 from agent.session_ctx import SessionContext
 from agent.state import FileState
@@ -117,7 +118,7 @@ def _strip_code_fence(text: str) -> str:
 def _generate_one(
     ctx: SessionContext,
     *,
-    client: anthropic.Anthropic,
+    bundle: ChatModelBundle,
     java_src: str,
     api_summary: str,
     system_prompt: str,
@@ -153,44 +154,29 @@ def _generate_one(
         f"fences, no commentary."
     )
 
-    response = client.messages.create(
-        model=ctx.cfg.agent.model,
-        max_tokens=16_000,
-        thinking={"type": "adaptive"},
-        system=[{
-            "type": "text",
-            "text": system_prompt,
-            "cache_control": {"type": "ephemeral"},
-        }],
-        messages=[{"role": "user", "content": user_prompt}],
-    )
+    system_content = apply_prompt_cache(system_prompt, bundle.supports_prompt_caching)
+    messages = [
+        SystemMessage(content=system_content),
+        HumanMessage(content=user_prompt),
+    ]
 
-    u = response.usage
-    turn_usage = TurnUsage(
-        input_tokens=u.input_tokens or 0,
-        output_tokens=u.output_tokens or 0,
-        cache_write_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
-        cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
-    )
+    response = bundle.chat.invoke(messages)
 
-    parts: list[str] = []
-    for block in response.content:
-        text = getattr(block, "text", None)
-        if isinstance(text, str):
-            parts.append(text)
-    return _strip_code_fence("".join(parts)), turn_usage
+    turn_usage = turn_usage_from_ai_message(response)
+    raw_text = _extract_text_from_ai_message(response)
+    return _strip_code_fence(raw_text), turn_usage
 
 
 def _record_usage(ctx: SessionContext, usage: TurnUsage, tag: str) -> float:
     ctx.cost.add_turn(usage, current_file=tag)
-    ctx.budget.add_usage(usage, ctx.cfg.agent.model)
-    return usage.cost_usd(ctx.cfg.agent.model)
+    ctx.budget.add_usage(usage, ctx.cfg.llm.model)
+    return usage.cost_usd(ctx.cfg.llm.model)
 
 
 def generate_tests(
     ctx: SessionContext,
     *,
-    client: anthropic.Anthropic,
+    bundle: ChatModelBundle,
     dry_run: bool = False,
 ) -> TestGenResult:
     """Generate ExUnit tests from Java test sources. Non-fatal on any error.
@@ -240,7 +226,7 @@ def generate_tests(
 
         try:
             source, usage = _generate_one(
-                ctx, client=client, java_src=java_path.read_text(),
+                ctx, bundle=bundle, java_src=java_path.read_text(),
                 api_summary=api_summary, system_prompt=system_prompt,
             )
             cost = _record_usage(ctx, usage, f"__test_{key}__")
@@ -279,7 +265,7 @@ def generate_tests(
         ctx.events.emit("info", message=f"[{i}] {key}: FAIL — retrying with error context")
         try:
             source2, usage2 = _generate_one(
-                ctx, client=client, java_src=java_path.read_text(),
+                ctx, bundle=bundle, java_src=java_path.read_text(),
                 api_summary=api_summary, system_prompt=system_prompt,
                 prior_failure=result.output_tail,
             )

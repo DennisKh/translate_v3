@@ -183,7 +183,7 @@ def test_list_files_status_filter_covers_every_advertised_value(tmp_path):
         ("escalated", {"G"}),
         ("failed", {"H", "I"}),
     ]:
-        result_str = list_files.call({"status": status})
+        result_str = list_files.run({"status": status})
         result = json.loads(result_str)
         actual = {f["stem"] for f in result["files"]}
         assert actual == expected_stems, (

@@ -1,5 +1,11 @@
 # v3 translate config — everything optional; positional args + defaults cover
 # the common case. Use this for non-Maven layouts, model overrides, etc.
+#
+# Provider-specific ready-to-use configs are in the repo root:
+#   translate.anthropic.toml   (default; thinking + prompt caching)
+#   translate.openai.toml      (GPT-5 family via OpenAI direct API)
+#   translate.lmstudio.toml    (LM Studio / vLLM / OpenRouter — OpenAI-compat)
+#   translate.ollama.toml      (fully local via Ollama)
 
 [source]
 # language = "java"                            # default
@@ -18,8 +24,31 @@ decimal = "~> 2.0"
 [target.dev_deps]
 credo = "~> 1.7"
 
+[llm]
+# provider = "anthropic"        # "anthropic" | "openai" | "ollama" — default: "anthropic"
+# model = "claude-opus-4-7"     # model name for the chosen provider
+# temperature = 0.0             # Anthropic ignores (API requires 1 with thinking); OpenAI/Ollama honor
+# max_tokens = 64000            # per-turn output ceiling (Anthropic: includes thinking tokens)
+#
+# Provider-specific knobs. Each is silently ignored by providers that don't use it,
+# so a single TOML CAN target multiple providers (change just `provider` + `model`).
+#
+# base_url:          OpenAI + Ollama. OpenAI default = api.openai.com. Ollama default =
+#                    http://localhost:11434. Point at LM Studio / vLLM / OpenRouter here.
+# num_ctx:           Ollama. Override Modelfile context window (fixes 400 on large prompts).
+# num_predict:       Ollama. Cap output tokens per turn.
+# reasoning_effort:  OpenAI (GPT-5 family). "minimal" | "low" | "medium" | "high".
+# cost_zero:         Any provider. True = silence "unknown model → $0" warnings for
+#                    custom local models whose name doesn't match a known free prefix.
+#
+# base_url = "http://localhost:11434"
+# num_ctx = 32768
+# num_predict = 4096
+# reasoning_effort = "medium"
+# cost_zero = false
+
 [agent]
-model = "claude-opus-4-7"
+# `model` moved to [llm] above (see "provider" + "model" keys).
 model_version_policy = "pinned"
 effort = "high"
 max_budget_tokens = 3_000_000
@@ -35,6 +64,3 @@ run_format = true
 run_credo = true
 credo_block_severity = "high"
 run_tests = false
-
-[safety]
-task_budget_beta = true

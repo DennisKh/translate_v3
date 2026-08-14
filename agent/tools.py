@@ -1,6 +1,6 @@
 """Tool implementations (Phases 1 + 2).
 
-Tools are `@beta_tool`-decorated closures over a `SessionContext`. Each tool
+Tools are `@tool`-decorated closures over a `SessionContext`. Each tool
 emits a structured event and records duration in the cost report so the summary
 can show per-tool stats.
 
@@ -15,7 +15,9 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BeforeValidator
 
-from anthropic.lib.tools import beta_tool
+from langchain_core.tools import tool
+from langgraph.graph import END
+from langgraph.types import Command
 
 from agent.events import time_tool
 from agent.mix_ops import (
@@ -23,7 +25,6 @@ from agent.mix_ops import (
     mix_compile,
     mix_credo,
     mix_format,
-    mix_test,
 )
 from agent.session_ctx import SessionContext
 from agent.state import FileEntry, FileState
@@ -84,7 +85,7 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
     # -----------------------------------------------------------------------
     # list_files
     # -----------------------------------------------------------------------
-    @beta_tool
+    @tool
     def list_files(status: Literal["all", "untranslated", "in_progress",
                                     "translated", "skipped", "deleted",
                                     "blocked", "escalated", "failed"] = "all") -> list[dict]:
@@ -153,7 +154,7 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
     # -----------------------------------------------------------------------
     # read_java
     # -----------------------------------------------------------------------
-    @beta_tool
+    @tool
     def read_java(stem: str, include_tests: bool = False) -> dict:
         """Read a Java source file and (optionally) its test files.
 
@@ -209,7 +210,7 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
     # -----------------------------------------------------------------------
     # read_elixir
     # -----------------------------------------------------------------------
-    @beta_tool
+    @tool
     def read_elixir(module_or_path: str) -> dict:
         """Read a generated Elixir source file.
 
@@ -259,7 +260,7 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
     # -----------------------------------------------------------------------
     # grep_elixir
     # -----------------------------------------------------------------------
-    @beta_tool
+    @tool
     def grep_elixir(pattern: str, path_glob: str = "lib/**/*.ex") -> dict:
         """Find literal-string matches across generated Elixir files.
 
@@ -319,7 +320,7 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
     # -----------------------------------------------------------------------
     # describe_module
     # -----------------------------------------------------------------------
-    @beta_tool
+    @tool
     def describe_module(module_or_path: str) -> dict:
         """Extract structured shape of a generated Elixir module.
 
@@ -352,9 +353,9 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
 
             shape = describe_file(path)
             if shape is None:
-                t.result(f"UNPARSEABLE {module}")
+                t.result(f"UNPARSEABLE {module_or_path}")
                 ctx.cost.add_tool("describe_module", 0)
-                return _json({"error": f"could not parse {module} as an Elixir module"})
+                return _json({"error": f"could not parse {module_or_path} as an Elixir module"})
 
             result = {
                 "module_name": shape.module_name,
@@ -384,7 +385,7 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
     # -----------------------------------------------------------------------
     # write_elixir
     # -----------------------------------------------------------------------
-    @beta_tool
+    @tool
     def write_elixir(module_or_path: str, contents: str) -> dict:
         """Write a full Elixir module to disk.
 
@@ -475,7 +476,7 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
     # -----------------------------------------------------------------------
     # edit_elixir
     # -----------------------------------------------------------------------
-    @beta_tool
+    @tool
     def edit_elixir(module_or_path: str, old_string: str, new_string: str) -> dict:
         """Surgical edit to an existing Elixir file.
 
@@ -545,7 +546,7 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
     # -----------------------------------------------------------------------
     # delete_elixir
     # -----------------------------------------------------------------------
-    @beta_tool
+    @tool
     def delete_elixir(module_or_path: str, reason: str = "") -> dict:
         """Delete a generated Elixir module (or refuse to create one).
 
@@ -590,7 +591,7 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
     # -----------------------------------------------------------------------
     # mix_compile / mix_format / mix_credo
     # -----------------------------------------------------------------------
-    @beta_tool
+    @tool
     def mix_compile_tool() -> dict:
         """Run `mix compile --warnings-as-errors` on the target project.
 
@@ -623,7 +624,7 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
                 "promoted_to_complete": promoted,
             })
 
-    @beta_tool
+    @tool
     def mix_format_tool(check_only: bool = False) -> dict:
         """Run `mix format`. `check_only=True` returns non-zero if any file would
         change (does not rewrite). `check_only=False` rewrites in place.
@@ -642,7 +643,7 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
                 "output_tail": result.output_tail,
             })
 
-    @beta_tool
+    @tool
     def mix_credo_tool(strict: bool = True) -> dict:
         """Run `mix credo --strict`. Returns structured issue list.
 
@@ -667,7 +668,7 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
     # -----------------------------------------------------------------------
     # validation_status — the "am I done" check
     # -----------------------------------------------------------------------
-    @beta_tool
+    @tool
     def validation_status() -> dict:
         """Run compile + format-check + credo, return combined status.
 
@@ -737,7 +738,7 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
     # -----------------------------------------------------------------------
     # escalate
     # -----------------------------------------------------------------------
-    @beta_tool
+    @tool
     def escalate(module_or_path: str, reason: str,
                  pause_dependents: bool = True) -> dict:
         """Record that you cannot resolve this file and move on.
@@ -790,7 +791,7 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
     # -----------------------------------------------------------------------
     # finish_polish (polish-mode only)
     # -----------------------------------------------------------------------
-    @beta_tool
+    @tool
     def finish_polish(
         summary: str,
         unfixable_warnings: Annotated[list[str], BeforeValidator(_coerce_str_or_list)],
@@ -825,21 +826,21 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
         """
         with time_tool(ctx.events, "finish_polish",
                        {"unfixable_count": len(unfixable_warnings)}) as t:
-            ctx.polish_finished = True
-            ctx.polish_finish_summary = summary[:400]
-            ctx.polish_finish_unfixable = tuple(unfixable_warnings)
             t.result(f"polish complete; {len(unfixable_warnings)} unfixable declared")
             ctx.cost.add_tool("finish_polish", 0)
-            return _json({
-                "ok": True,
-                "polish_complete": True,
-                "unfixable_count": len(unfixable_warnings),
-            })
+            return Command(
+                update={
+                    "finish_called": True,
+                    "finish_summary": summary[:400],
+                    "finish_unfixable": tuple(unfixable_warnings),
+                },
+                goto=END,
+            )
 
     # -----------------------------------------------------------------------
     # finish_translate (main-mode Phase A sentinel)
     # -----------------------------------------------------------------------
-    @beta_tool
+    @tool
     def finish_translate(summary: str) -> dict:
         """Declare Phase A translation complete.
 
@@ -889,15 +890,16 @@ def build_tools(ctx: SessionContext, *, include_write: bool = False,
                     ],
                 })
 
-            ctx.phase_a_finished = True
-            ctx.phase_a_summary = summary[:800]
             t.result(f"Phase A complete ({len(ctx.state.all())} files addressed)")
             ctx.cost.add_tool("finish_translate", 0)
-            return _json({
-                "ok": True,
-                "phase_a_complete": True,
-                "files_addressed": len(ctx.state.all()),
-            })
+            return Command(
+                update={
+                    "finish_called": True,
+                    "finish_summary": summary[:800],
+                    "finish_unfixable": (),
+                },
+                goto=END,
+            )
 
     if polish_mode:
         # Curated polish tools: reads (target-side only), edit, mix checks, finish.

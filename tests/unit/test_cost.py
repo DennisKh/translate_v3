@@ -43,9 +43,85 @@ def test_cost_breakdown_reflects_model_not_hardcoded():
     assert haiku["output_usd"] == 5.00
 
 
-def test_pricing_for_falls_back_to_opus():
-    fallback = pricing_for("nonexistent-model-2099")
-    assert fallback == MODEL_PRICING["claude-opus-4-7"]
+def test_pricing_for_unknown_model_returns_zeros_with_warning():
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        fallback = pricing_for("nonexistent-model-2099")
+    assert fallback == {"in": 0.0, "out": 0.0, "cache_write": 0.0, "cache_read": 0.0}
+    assert len(w) == 1
+    assert "nonexistent-model-2099" in str(w[0].message)
+    assert issubclass(w[0].category, UserWarning)
+
+
+def test_pricing_for_ollama_llama_is_zero_no_warning():
+    """Ollama local models are free — pricing_for must return zeros silently."""
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        p = pricing_for("llama3.1:8b")
+    assert p == {"in": 0.0, "out": 0.0, "cache_write": 0.0, "cache_read": 0.0}
+    assert len(w) == 0
+
+
+def test_pricing_for_ollama_qwen_is_zero_no_warning():
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        p = pricing_for("qwen2.5-coder:1.5b-base")
+    assert p == {"in": 0.0, "out": 0.0, "cache_write": 0.0, "cache_read": 0.0}
+    assert len(w) == 0
+
+
+def test_cost_report_ollama_model_records_zero_cost(tmp_path):
+    """Regression for bug where CostReport initialized with cfg.agent.model
+    (defaulting to claude-opus-4-7) computed bogus dollars for Ollama runs."""
+    r = CostReport(model="llama3.1:8b", state_dir=tmp_path)
+    r.add_turn(TurnUsage(input_tokens=10_000, output_tokens=5_000))
+    r.persist()
+
+    import json
+    data = json.loads((tmp_path / "cost_report.json").read_text())
+    assert data["model"] == "llama3.1:8b"
+    assert data["totals"]["cost_usd"] == 0.0
+
+
+def test_pricing_for_gpt5_mini_returns_real_rates_no_warning():
+    """Bug B regression: gpt-5-mini must hit MODEL_PRICING, not the unknown fallback."""
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        p = pricing_for("gpt-5-mini")
+    assert len(w) == 0
+    assert p["in"] > 0.0
+    assert p["out"] > 0.0
+
+
+def test_pricing_for_gpt5_returns_real_rates_no_warning():
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        p = pricing_for("gpt-5")
+    assert len(w) == 0
+    assert p["in"] > 0.0
+    assert p["out"] > 0.0
+
+
+def test_pricing_for_gpt4o_mini_returns_real_rates_no_warning():
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        p = pricing_for("gpt-4o-mini")
+    assert len(w) == 0
+    assert p["in"] > 0.0
+    assert p["out"] > 0.0
+
+
+def test_openai_turn_cost_nonzero():
+    """gpt-5-mini: 1M input tokens should compute a non-zero cost."""
+    u = TurnUsage(input_tokens=1_000_000)
+    cost = u.cost_usd("gpt-5-mini")
+    assert cost == pytest.approx(0.25, abs=0.001)
 
 
 def test_budget_status_none_when_fine():
@@ -134,3 +210,52 @@ def test_cost_report_persist_is_atomic(tmp_path):
     assert "Foo" in data["by_file"]
     assert data["by_tool"]["read_java"]["calls"] == 1
     assert data["by_tool"]["read_java"]["total_ms"] == 42
+
+
+def test_devstral_prefix_is_free_no_warning():
+    """Regression: user's custom `devstral-small-24-q3:latest` triggered a
+    spurious 'unknown model → $0' warning because 'devstral' wasn't in the
+    free-prefix list."""
+    import warnings
+    from agent.cost import _warned_models
+    _warned_models.discard("devstral-small-24-q3:latest")
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        p = pricing_for("devstral-small-24-q3:latest")
+    assert p["in"] == 0.0
+    assert p["out"] == 0.0
+    assert not any("unknown model" in str(x.message) for x in w)
+
+
+def test_granite_prefix_is_free_no_warning():
+    import warnings
+    from agent.cost import _warned_models
+    _warned_models.discard("granite-3.0:8b")
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        p = pricing_for("granite-3.0:8b")
+    assert p["in"] == 0.0
+    assert not any("unknown model" in str(x.message) for x in w)
+
+
+def test_cost_zero_kwarg_silences_warning_for_custom_local_model():
+    """LM Studio / vLLM local models with arbitrary names should not warn
+    when the config sets `cost_zero = true`."""
+    import warnings
+    from agent.cost import _warned_models
+    _warned_models.discard("my-custom-fine-tuned-model")
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        p = pricing_for("my-custom-fine-tuned-model", cost_zero=True)
+    assert p == {"in": 0.0, "out": 0.0, "cache_write": 0.0, "cache_read": 0.0}
+    assert not any("unknown model" in str(x.message) for x in w)
+
+
+def test_cost_zero_false_still_warns_for_truly_unknown_model():
+    import warnings
+    from agent.cost import _warned_models
+    _warned_models.discard("really-truly-unknown-model-xyz")
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        pricing_for("really-truly-unknown-model-xyz", cost_zero=False)
+    assert any("unknown model" in str(x.message) for x in w)

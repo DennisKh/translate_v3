@@ -1,0 +1,16 @@
+flowchart TD
+    START([START]) --> agent
+    agent["<b>agent_node</b><br/>ChatModel.invoke(state.messages)<br/>→ appends AIMessage"]
+    tools["<b>tools_node</b><br/>for each tc in AIMessage.tool_calls:<br/>execute tool → append ToolMessage"]
+    ENDs([END])
+    ENDf([END])
+
+    agent -->|route_after_agent<br/>has tool_calls| tools
+    agent -.->|route_after_agent<br/>no tool_calls<br/><i>safety fallback / Ollama primary exit</i>| ENDs
+    tools -->|route_after_tools<br/>sentinel NOT called| agent
+    tools -->|route_after_tools<br/>finish sentinel called| ENDf
+
+    classDef node fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px,color:#000
+    classDef terminal fill:#fff,stroke:#5f6368,stroke-width:1.5px,color:#000
+    class agent,tools node
+    class START,ENDs,ENDf terminal

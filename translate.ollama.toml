@@ -1,0 +1,25 @@
+# Ready-to-use Ollama config for local-model smoke tests.
+# Ollama is 100% local (free, no API key needed) but tool-calling quality on
+# 8B-14B models is unreliable — see PLAN_LANGGRAPH.md §6 (Ollama = "smoke —
+# local dev" tier, not regression bar).
+#
+# Prerequisite: `ollama serve` running in another terminal and the chosen
+# model pulled locally (`ollama pull llama3.1:8b`).
+
+[llm]
+provider = "ollama"
+# devstral-small-24-q3 — user-built Ollama model from Bartowski's Q3_K_M GGUF
+# of mistralai/Devstral-Small-2-24B-Instruct-2512. 11GB on disk, tools
+# capability confirmed via `ollama show`. SWE-bench Verified 68.0% at 24B.
+# Alternative if not available: `ollama pull devstral-small-2:24b` (Q4_K_M
+# from Ollama's official registry, ~14GB).
+model = "devstral-small-24-q3:latest"
+temperature = 0.0
+# base_url = "http://localhost:11434"   # default; override if Ollama runs elsewhere
+# num_ctx = 32768                       # override the Modelfile default context (fixes 400 on big prompts)
+# num_predict = 4096                    # cap output tokens per turn (default: model-driven)
+
+[agent]
+# Ollama is slower per turn on CPU; cap wall time generously.
+max_wall_seconds = 5400
+max_tool_calls = 500

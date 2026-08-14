@@ -1,7 +1,15 @@
 """Cost accounting + per-file / per-tool breakdown + hard caps.
 
-Model pricing table below is per-1M tokens. Update when Anthropic changes it.
-Numbers based on the values documented in this project's CLAUDE-API skill.
+Two-tier model pricing:
+- Anthropic models: real per-1M-token rates from the pricing table below.
+  Update when Anthropic revises published prices.
+- OpenAI models: real per-1M-token rates from the OpenAI direct API pricing
+  page (https://openai.com/api/pricing/). LM Studio / local OpenAI-compatible
+  endpoints should use provider="ollama" — they run at $0 and are handled by
+  the unknown-model → warn + zero fallback.
+- All other models (Ollama, local, unknown): zero cost. pricing_for() returns
+  zeros and emits a one-time warnings.warn() for any unrecognised model so
+  future "unknown model → bogus dollars" bugs are visible in run output.
 """
 
 from __future__ import annotations
@@ -9,23 +17,77 @@ from __future__ import annotations
 import json
 import threading
 import time
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
 
-# Per-1M-token pricing in USD. Update when Anthropic revises.
+# Per-1M-token pricing in USD.
+# Ollama and other local models are intentionally absent — they run at $0.
+#
+# OpenAI rates are for direct OpenAI API access. OpenAI does not charge a
+# cache_write surcharge — writing to cache costs the same as a regular input
+# token, so cache_write == in. Cache reads are ~10% of input rate.
+# Verified against https://openai.com/api/pricing/ via litellm's pricing
+# database (2026-08-13).
 MODEL_PRICING: dict[str, dict[str, float]] = {
+    # Anthropic
     "claude-opus-4-7":   {"in": 5.00, "out": 25.00, "cache_write": 6.25, "cache_read": 0.50},
     "claude-opus-4-6":   {"in": 5.00, "out": 25.00, "cache_write": 6.25, "cache_read": 0.50},
     "claude-sonnet-4-6": {"in": 3.00, "out": 15.00, "cache_write": 3.75, "cache_read": 0.30},
     "claude-haiku-4-5":  {"in": 1.00, "out":  5.00, "cache_write": 1.25, "cache_read": 0.10},
+    # OpenAI (direct API; local OpenAI-compatible endpoints → use provider=ollama → $0)
+    "gpt-5":       {"in": 1.25, "out": 10.00, "cache_write": 1.25, "cache_read": 0.125},
+    "gpt-5-mini":  {"in": 0.25, "out":  2.00, "cache_write": 0.25, "cache_read": 0.025},
+    "gpt-4o-mini": {"in": 0.15, "out":  0.60, "cache_write": 0.15, "cache_read": 0.075},
 }
 
+# Zero-cost sentinel used for local/free models (Ollama etc.).
+_ZERO_PRICING: dict[str, float] = {"in": 0.0, "out": 0.0, "cache_write": 0.0, "cache_read": 0.0}
 
-def pricing_for(model: str) -> dict[str, float]:
-    """Per-1M-token rates for a model. Falls back to Opus 4.7 with a warning."""
-    return MODEL_PRICING.get(model, MODEL_PRICING["claude-opus-4-7"])
+# Prefixes for known zero-cost model families so we don't warn about them.
+# Order doesn't matter — matched against the model-name basename.
+_FREE_MODEL_PREFIXES = (
+    "llama", "qwen", "mistral", "hermes", "gemma", "phi",
+    "deepseek", "codellama", "devstral", "granite", "dolphin",
+    "wizard", "starcoder", "commandr", "yi", "olmo",
+)
+
+# Track which unknown models we've already warned about to emit only once per process.
+_warned_models: set[str] = set()
+
+
+def pricing_for(model: str, *, cost_zero: bool = False) -> dict[str, float]:
+    """Per-1M-token rates for a model.
+
+    Returns real published rates for known Anthropic and OpenAI models. For
+    any model not in the pricing table, returns zeros. Warns exactly once per
+    process for truly unknown model names so bogus dollar amounts don't hide.
+
+    ``cost_zero=True`` opt-out silences the warning for custom local models
+    whose name doesn't match a known free-model prefix (e.g. a custom
+    LM Studio Modelfile). Config: ``[llm] cost_zero = true``.
+    """
+    if model in MODEL_PRICING:
+        return MODEL_PRICING[model]
+    if cost_zero:
+        return _ZERO_PRICING
+    # Silently free for known local-model families (Ollama namespaced names like
+    # "llama3.1:8b", "qwen2.5-coder:1.5b", "mistral-nemo:latest" etc.)
+    base = model.split(":")[0].split("-")[0].lower()
+    if any(base.startswith(prefix) for prefix in _FREE_MODEL_PREFIXES):
+        return _ZERO_PRICING
+    # Unknown model — warn once, then treat as free to avoid bogus dollar amounts.
+    if model not in _warned_models:
+        _warned_models.add(model)
+        warnings.warn(
+            f"pricing_for: unknown model {model!r} — treating as $0/token. "
+            "Add it to MODEL_PRICING in agent/cost.py if it has real API costs, "
+            "or set [llm] cost_zero = true in the TOML if it's a local model.",
+            stacklevel=2,
+        )
+    return _ZERO_PRICING
 
 
 @dataclass

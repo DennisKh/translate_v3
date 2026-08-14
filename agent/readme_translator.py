@@ -13,9 +13,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import anthropic
+from langchain_core.messages import HumanMessage, SystemMessage
 
-from agent.cost import TurnUsage
+from agent.llm import ChatModelBundle, _extract_text_from_ai_message, apply_prompt_cache, turn_usage_from_ai_message
 from agent.session_ctx import SessionContext
 from agent.state import FileState
 from language.elixir import describe_file
@@ -67,7 +67,7 @@ def _compact_api_summary(ctx: SessionContext) -> str:
 def translate_readme(
     ctx: SessionContext,
     *,
-    client: anthropic.Anthropic,
+    bundle: ChatModelBundle,
     dry_run: bool = False,
 ) -> bool:
     """Rewrite source README as an Elixir-flavored README. Non-fatal.
@@ -114,18 +114,14 @@ def translate_readme(
         f"the rules from the system prompt. Return raw markdown only."
     )
 
+    system_content = apply_prompt_cache(system_prompt, bundle.supports_prompt_caching)
+    messages = [
+        SystemMessage(content=system_content),
+        HumanMessage(content=user_prompt),
+    ]
+
     try:
-        response = client.messages.create(
-            model=ctx.cfg.agent.model,
-            max_tokens=16_000,
-            thinking={"type": "adaptive"},
-            system=[{
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }],
-            messages=[{"role": "user", "content": user_prompt}],
-        )
+        response = bundle.chat.invoke(messages)
     except Exception as exc:  # noqa: BLE001
         # Broad catch — README rewrite is a non-fatal one-shot. Any failure
         # (network, malformed response, unexpected SDK behavior) should log
@@ -136,23 +132,13 @@ def translate_readme(
         return False
 
     # Record cost
-    usage = response.usage
-    turn_usage = TurnUsage(
-        input_tokens=usage.input_tokens or 0,
-        output_tokens=usage.output_tokens or 0,
-        cache_write_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
-        cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
-    )
+    turn_usage = turn_usage_from_ai_message(response)
     ctx.cost.add_turn(turn_usage, current_file="__readme__")
-    ctx.budget.add_usage(turn_usage, ctx.cfg.agent.model)
+    ctx.budget.add_usage(turn_usage, ctx.cfg.llm.model)
 
-    # Extract text
-    parts = []
-    for block in response.content:
-        text = getattr(block, "text", None)
-        if isinstance(text, str):
-            parts.append(text)
-    new_readme = "".join(parts).strip()
+    # Extract text — with adaptive thinking, content is list[dict]; without it,
+    # content is str. _extract_text_from_ai_message handles both.
+    new_readme = _extract_text_from_ai_message(response).strip()
 
     if not new_readme:
         ctx.events.emit("warn", message="README translation returned empty output — skipping write")
@@ -160,7 +146,6 @@ def translate_readme(
 
     # Strip any code-fence wrapper the model may have added despite instructions
     if new_readme.startswith("```"):
-        # Try to strip leading and trailing fences
         lines = new_readme.splitlines()
         if lines[0].startswith("```"):
             lines = lines[1:]
@@ -172,6 +157,6 @@ def translate_readme(
     ctx.events.emit(
         "phase_end", phase="readme",
         message=f"wrote {target_readme} ({new_readme.count(chr(10)) + 1} lines, "
-                f"cost ${turn_usage.cost_usd(ctx.cfg.agent.model):.3f})",
+                f"cost ${turn_usage.cost_usd(ctx.cfg.llm.model):.3f})",
     )
     return True

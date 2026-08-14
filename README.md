@@ -1,15 +1,20 @@
 # translate-v3
 
-Agentic Java → Elixir translator built on the Anthropic API. Third iteration
-of the tool; agent-first architecture with tool use, prompt caching, task
-budgets, dependency-aware coordination, and structurally-enforced completion
+Agentic Java → Elixir translator. Third iteration of the tool; agent-first
+architecture built on LangGraph + LangChain, with tool use, prompt caching
+(Anthropic), dependency-aware coordination, and structurally-enforced completion
 via `tool_choice="any"` + sentinel tools (`finish_translate`, `finish_polish`).
 
-**Status:** Phases 0–4 complete — translation, polish loop, README rewriter,
-metadata copy, and ExUnit test generation all shipped. Verified end-to-end on
-joda-money (23 classes), fast-uuid (1 class), and java-string-similarity (~25
-classes). See [`PLAN.md`](PLAN.md) for the design doc + §17 for
-implementation deltas (bug fixes, architectural pivots, dead-code removal).
+**Status:** LangGraph migration complete — all phases shipped on LangGraph +
+LangChain with multi-provider support (Anthropic / OpenAI / Ollama / LM Studio;
+swap via config, no code changes). 207 unit tests passing. Regression baseline
+captured: 92% symbol coverage / 100% test parity on joda-money; fast-uuid smoke
+passed on Anthropic and OpenAI; Ollama plumbing smoke passed. See
+[`PLAN_LANGGRAPH.md`](PLAN_LANGGRAPH.md) for the migration design and
+[`REVIEW_PROVIDER_AGNOSTICISM.md`](REVIEW_PROVIDER_AGNOSTICISM.md) for the
+provider-abstraction audit. [`PLAN.md`](PLAN.md) documents the original
+Anthropic-native v3 architecture (historical reference + §17 for implementation
+deltas).
 
 ## What it does
 
@@ -27,29 +32,102 @@ Point it at a Java project + an output path. It:
 
 - **Python 3.11+** (stdlib `tomllib`)
 - **Elixir 1.17+ / OTP 26+** — asdf-managed preferred; PATH and brew fallbacks
-- **`ANTHROPIC_API_KEY`** in the environment (or `--dry-run` for a no-cost smoke test)
+- **LangChain packages** — pinned in `requirements.txt`:
+  `langchain-core`, `langchain-anthropic`, `langchain-openai`, `langchain-ollama`,
+  `langgraph`
+- **`python-dotenv`** — `main.py` loads `.env` automatically at startup
+- **Provider API key** in the environment or in `translate_v3/.env` (or `--dry-run`
+  for a no-cost scaffold + plan smoke test):
+  - Anthropic: `ANTHROPIC_API_KEY`
+  - OpenAI / LM Studio: `OPENAI_API_KEY`
+  - Ollama: no key needed (local)
 
 ## Quick start
 
 ```bash
 pip install -r requirements.txt
-
-# Smoke test (no API calls) — verify scaffold works end-to-end
-python main.py /path/to/java/project /path/to/output --dry-run
-
-# Real run — for joda-money specifically
-export ANTHROPIC_API_KEY=sk-ant-...
-python main.py /var/www/training/joda-money /var/www/training/joda-money-v3 \
-    --app-name joda_money --module-name JodaMoney --verbose
 ```
 
-Rough cost/time (Sonnet 4.6, verified on real runs):
-- **joda-money** (23 classes): ~$5–8 fresh, ~$0.30 clean resume, 5–10 min wall time
-- **fast-uuid** (1 class): ~$0.30, ~30 sec
-- **java-string-similarity** (~25 classes): ~$5–10 with polish, ~5–10 min
+Provider is selected via a TOML config file — one config line, one command. Four
+sample configs live at the repo root:
 
-Opus 4.7 available via `--model claude-opus-4-7` — expect 2–3× the cost for
-marginally better structural refactoring on complex modules.
+### Anthropic (default)
+
+```bash
+# Put ANTHROPIC_API_KEY=sk-ant-... in translate_v3/.env — main.py auto-loads it
+cp translate.anthropic.toml my.toml
+
+# Smoke test (no API calls) — verify scaffold works end-to-end
+python main.py /path/to/java/project /path/to/output --config my.toml --dry-run
+
+# Real run — joda-money
+python main.py /var/www/training/joda-money /var/www/training/joda-money-v3 \
+    --app-name joda_money --module-name JodaMoney --config translate.anthropic.toml --verbose
+```
+
+### OpenAI
+
+```bash
+# Put OPENAI_API_KEY=sk-... in .env
+python main.py /path/to/java /path/to/output --config translate.openai.toml --dry-run
+```
+
+### Ollama (local, no API key)
+
+```bash
+# ollama serve must be running; model must be pulled first
+# ollama pull devstral-small-2:24b  (or the model named in the TOML)
+python main.py /path/to/java /path/to/output --config translate.ollama.toml --dry-run
+```
+
+### LM Studio (or any OpenAI-compatible endpoint)
+
+```bash
+# LM Studio server on :1234; set OPENAI_API_KEY=lm-studio (any string)
+python main.py /path/to/java /path/to/output --config translate.lmstudio.toml --dry-run
+```
+
+See [Provider configuration](#provider-configuration) for the capability matrix and
+per-provider knob reference.
+
+Rough cost/time (Opus 4.7 with adaptive thinking, verified on real runs):
+- **fast-uuid** (1 class): ~$1.64, ~84 sec (adaptive thinking premium; cache hits 31%)
+- **joda-money** (23 classes): ~$5–8 fresh, ~$0.30 clean resume, 5–10 min wall time
+- **java-string-similarity** (~25 classes): ~$5–10 with polish, ~5–10 min
+- **OpenAI / Ollama**: cost varies by model; set `cost_zero = true` in config for local models
+
+## Provider configuration
+
+The provider is the only thing that changes between configs. No code edits needed —
+swap the TOML, set the matching API key. See
+[`REVIEW_PROVIDER_AGNOSTICISM.md`](REVIEW_PROVIDER_AGNOSTICISM.md) for the audit
+and design rationale behind this isolation.
+
+| Provider | Sample config | `tool_choice` enforced | Prompt caching | Adaptive thinking | Cost profile |
+|---|---|---|---|---|---|
+| Anthropic | [`translate.anthropic.toml`](translate.anthropic.toml) | Yes (`{"type":"any"}`) | Yes — system prompt + tool schemas | Yes (`thinking: adaptive`) | ~$15–25/M out (Opus 4.7) |
+| OpenAI | [`translate.openai.toml`](translate.openai.toml) | Yes (`"required"`) | Server-side automatic (not surfaced in cost report) | No — use `reasoning_effort` instead | ~$0.25–1.25/M in, $2–10/M out (gpt-5 family) |
+| Ollama | [`translate.ollama.toml`](translate.ollama.toml) | No (ChatOllama ignores `tool_choice`) | No | No | Free (local) |
+| LM Studio / vLLM / OpenRouter | [`translate.lmstudio.toml`](translate.lmstudio.toml) | Yes (via OpenAI builder) | No | No | Free or cost_zero=true |
+
+All provider-specific knowledge is isolated in `agent/llm.py`. Callers see a
+plain `BaseChatModel` and a `ChatModelBundle` — no provider branches in
+`translator.py`, `graph.py`, or anywhere else in the agent layer.
+
+### Provider-specific config knobs
+
+| Key | Provider | Purpose |
+|---|---|---|
+| `llm.base_url` | OpenAI / Ollama | Override API endpoint (LM Studio: `http://localhost:1234/v1`) |
+| `llm.reasoning_effort` | OpenAI GPT-5 | `"minimal"` / `"low"` / `"medium"` / `"high"` |
+| `llm.num_ctx` | Ollama | Override context window (fixes 400 on large prompts) |
+| `llm.num_predict` | Ollama | Cap per-turn output tokens |
+| `llm.cost_zero` | Any | Silence "unknown model" warning for local/custom model names |
+| `agent.thinking_budget_tokens` | Anthropic | `0` = adaptive (recommended); `>0` = hard token cap |
+
+Unknown-provider or custom model names fall back to zero cost (warn once) so
+runs are never blocked by a missing pricing entry. Add new models to
+`agent/cost.py:MODEL_PRICING` to get accurate accounting.
 
 ## CLI
 
@@ -139,6 +217,10 @@ main.py                     CLI + orchestration + Phase A/B/README wiring
 │   ├── deps.py             topological levels + SCC (cycle) detection
 │   └── naming.py           camel_to_snake, sanitize_app_name (shared)
 ├── agent/
+│   ├── llm.py              LLM factory (build_chat_model → ChatModelBundle),
+│   │                       classify_exception (provider-agnostic exception routing)
+│   ├── graph.py            LangGraph StateGraph builders — build_translation_graph,
+│   │                       build_polish_graph; agent_node, tools_node, routing fns
 │   ├── state.py            9-state file machine, atomic JSON persistence
 │   ├── cost.py             per-model pricing, dollar-based budget, per-file report
 │   ├── events.py           thread-safe JSONL event stream + heartbeat thread
@@ -146,7 +228,9 @@ main.py                     CLI + orchestration + Phase A/B/README wiring
 │   ├── mix_ops.py          mix compile/format/credo/test with bomb-warning detection
 │   ├── session_ctx.py      shared context object for tools
 │   ├── tools.py            14 tools main / 10 tools polish (see below)
-│   ├── translator.py       multi-session loop, sentinel handling, polish, synth
+│   │                       decorated with @tool from langchain_core
+│   ├── translator.py       multi-session loop driving graph.stream(); sentinel
+│   │                       handling, polish, synth — wraps the LangGraph subgraphs
 │   ├── readme_translator.py  Post-Phase-A README rewriter (one-shot, non-agent)
 │   └── test_writer.py      Phase B — JUnit → ExUnit converter (per-file, non-agent)
 ├── language/
@@ -159,8 +243,43 @@ main.py                     CLI + orchestration + Phase A/B/README wiring
 └── tests/
     ├── gold/               hand-verified reference modules + ExUnit tests
     ├── regression/         scorer: symbol coverage, test parity, style
-    └── unit/               98 tests, all green
+    └── unit/               207 tests, all green
 ```
+
+### Agent graph
+
+Both `translation_graph` and `polish_graph` share the same topology — an
+`agent ↔ tools` cycle with a sentinel-tool exit. The diagram below is
+hand-written to match the implementation in `agent/graph.py` with routing
+labels; the auto-generated version (`graph.get_graph().draw_mermaid()`)
+omits the condition labels.
+
+```mermaid
+flowchart TD
+    START([START]) --> agent
+    agent["agent_node\nChatModel.invoke(state.messages)\n→ appends AIMessage"]
+    tools["tools_node\nfor each tc in AIMessage.tool_calls:\nexecute tool → append ToolMessage"]
+    ENDs([END])
+    ENDf([END])
+
+    agent -->|route_after_agent: has tool_calls| tools
+    agent -.->|route_after_agent: no tool_calls\nsafety fallback / Ollama primary exit| ENDs
+    tools -->|route_after_tools: sentinel not called| agent
+    tools -->|route_after_tools: finish sentinel called| ENDf
+```
+
+The two graphs differ only in the bound tool set and the sentinel name:
+
+| | `translation_graph` | `polish_graph` |
+|---|---|---|
+| Tools | 14 (includes write_elixir, delete_elixir, finish_translate) | 10 (read/edit/verify subset + finish_polish) |
+| Sentinel | `finish_translate` | `finish_polish` |
+
+`SessionContext` (config, scaffold, StateStore, EventStream, CostReport,
+budget) is bound into tool functions as a closure at graph build time — not
+stored in `AgentState`. `AgentState` is session-scoped and dropped after each
+graph run (session-reset is deliberate context loss, not a checkpointer
+scenario — see `PLAN_LANGGRAPH.md §8`).
 
 ## Tools
 
@@ -202,6 +321,11 @@ transitively-dependent downstream files.
 - `finish_polish(summary, unfixable_warnings)` — polish loop. Model
   declares which credo warnings it left unfixed and why.
 
+Both sentinel tools return `Command(update={finish_called, finish_summary, ...}, goto=END)`
+via LangGraph state — the tools_node detects this, pairs a ToolMessage with
+every tool_call in the batch (preserving the tool_use/tool_result pairing
+invariant), and routes the graph to END.
+
 ### Why sentinel tools + `tool_choice="any"`
 
 The model cannot emit `end_turn` on its own — the API enforces at least
@@ -218,12 +342,34 @@ See PLAN.md §17.7 for the full evolution.
 
 ## Key design decisions
 
+- **LangGraph StateGraph for edge-driven flow.** The two agentic loops
+  (translation and polish) are `StateGraph` instances. Adding a new step is
+  one node + two edges — no surgery on a 200-line `while True` loop. Pure
+  Python orchestration wraps the graphs for multi-session, rate-limit, budget,
+  and heartbeat concerns (straight-line pipelines don't benefit from a graph).
+- **LangChain `ChatModel` abstraction for provider portability.** All LLM
+  calls go through `BaseChatModel.invoke()` or `bind_tools(...).invoke()`.
+  Provider selection is `[llm] provider = "..."` in config. No provider
+  branches in `translator.py`, `graph.py`, or the tools layer.
+- **Provider knowledge isolated in `agent/llm.py`.** The factory
+  (`build_chat_model`), the provider-specific kwargs, and
+  `classify_exception` (which maps Anthropic / OpenAI / httpx exceptions to
+  a common `ExceptionKind` enum) all live here. No leakage into the graph,
+  translator, or cost layer. New provider = new `_build_*` function + pricing
+  entry in this one file.
+- **Provider-agnostic exception classification via `classify_exception`.**
+  OpenAI `RateLimitError`, Anthropic `RateLimitError`, and httpx `ReadTimeout`
+  all land as `ExceptionKind.RATE_LIMIT` → same retry/backoff path.
+  Previously, non-Anthropic errors fell through to `parse_failure` and killed
+  runs on the first transient failure.
 - **Structural completion via `tool_choice="any"` + sentinel tools.** The
   headline pattern. Model physically cannot emit `end_turn` — it must call
   a tool every turn, and only `finish_translate` / `finish_polish` can end
   the session. Sentinel tools validate preconditions at their own
   boundary (Pydantic types + non-terminal-files check), so bad completion
   attempts get rejected with actionable errors and the model retries.
+  Ported from the Anthropic-native design unchanged in intent; implemented
+  via `Command(goto=END)` in LangGraph.
 - **Warnings-as-errors:** `mix compile --warnings-as-errors` catches
   "undefined or private" bombs that v2 shipped silently.
 - **Validation gate before completion:** `validation_status()` must be
@@ -232,15 +378,17 @@ See PLAN.md §17.7 for the full evolution.
 - **Session-reset checkpointing:** every N files or M tokens per session,
   agent starts a fresh session with a state summary (not history replay)
   — avoids long-context degradation, keeps cache-hot per-session.
+  Session-reset is deliberate context loss; the LangGraph checkpointer is
+  intentionally not used (see `PLAN_LANGGRAPH.md §8`).
 - **Polish loop as defense-in-depth:** four layers — structural (`tool_choice`
   + sentinel), behavioral (5-read cap before edit required), semantic
   ("reading doesn't fix" prompt rule), efficiency (`grep_elixir` for
   multi-site work). Skip-on-resume via `.translate_v3_state/polish.json`
   cache when credo warning set is unchanged.
-- **Task Budgets** (Opus 4.7 beta): model sees remaining budget and
-  self-moderates.
-- **Prompt caching** on system prompt + tool schemas + credo/API-summary
-  context: after warmup, ≥90% of input tokens are cache reads.
+- **Prompt caching** on system prompt + tool schemas (Anthropic only via
+  `cache_control: ephemeral` content blocks): after warmup, cache-read
+  tokens cost 0.1× normal input. On fast-uuid with Opus 4.7: 31% cache
+  hit rate on a single-session run; joda-money multi-session runs reach 54%.
 - **Dollar-based budget:** cache reads cost 0.1× normal input; counting
   them at full weight would penalize cache-warm runs (the exact
   optimization we want). Summary shows `Budget used: 12% ($2.98 / $25.00)`
@@ -249,6 +397,10 @@ See PLAN.md §17.7 for the full evolution.
   (checkpoint, budget hit, parse failure, crash), outcome is synthesized
   from disk state with real `mix compile/format/credo`. On-disk work is
   never lost.
+- **StateStore (files.json) stays authoritative.** File-level state is
+  project-keyed JSON, independent of LangGraph's checkpointer. Resume is
+  cross-machine and cross-session without tying to LangGraph's checkpoint
+  schema.
 - **Path traversal guards:** `write_elixir` / `edit_elixir` refuse paths
   outside target root.
 - **Non-fatal side channels:** README rewrite, Phase B tests, regression
@@ -320,7 +472,7 @@ Scores appear in the summary and in `.translate_v3_state/summary.json`.
 ## Running the test suite
 
 ```bash
-pytest tests/unit                    # 98 tests, ~14s (includes 9 mix integration tests)
+pytest tests/unit                    # 207 tests, all green (includes 9 mix integration tests)
 pytest tests/unit -k "not mix_ops"   # unit-only, ~1s
 ```
 
@@ -336,7 +488,11 @@ See [`translate.toml.example`](translate.toml.example). Common uses:
 
 ## What NOT to expect
 
-- **Not multi-provider.** Anthropic API only.
+- **Not a plugin registry.** Anthropic, OpenAI, Ollama, and LM Studio (via
+  OpenAI-compat) are supported. Adding a new provider (Gemini, Cohere,
+  Bedrock) requires ~20 lines in `agent/llm.py` (a `_build_*` function and a
+  `classify_exception` branch) plus a pricing entry. That's the correct level
+  of extension work, not a config line.
 - **Not a service.** CLI tool, human-triggered.
 - **Not multi-language pairs beyond Java→Elixir.** The architecture is language-agnostic; adding e.g. Python→Rust requires new prompt + parser adapters.
 - **Not integrated with CI.** Run it, review the diff, commit.

@@ -1,0 +1,33 @@
+# Ready-to-use Anthropic config. This is the default — everything Anthropic
+# does that other providers don't (adaptive thinking, prompt caching, per-turn
+# thinking-token accounting) is enabled automatically for provider="anthropic".
+# Requires ANTHROPIC_API_KEY in translate_v3/.env (main.py auto-loads .env
+# via python-dotenv).
+#
+# Anthropic-specific notes:
+# - Prompt caching: apply_prompt_cache() sends the system prompt with
+#   cache_control markers so first-call writes to cache, subsequent calls read
+#   from it. Hits show up in cost_report.json under cache_read.
+# - Adaptive thinking: enabled by default (thinking_budget_tokens = 0 below).
+#   Set thinking_budget_tokens > 0 for a hard cap on deliberation tokens.
+# - Temperature: the API requires temperature=1 (or omitted) when thinking is
+#   enabled; our _build_anthropic passes temperature=None regardless of the
+#   TOML value. So cfg.llm.temperature has no effect for Anthropic.
+# - tool_choice: bundle sends {"type": "any"}. bundle.forces_tool_call = True
+#   — sentinel exit is primary.
+
+[llm]
+provider = "anthropic"
+# Alternatives:
+# - "claude-opus-4-7"     — top quality, ~$5/M in, $25/M out
+# - "claude-sonnet-4-6"   — mid tier,     ~$3/M in, $15/M out
+# - "claude-haiku-4-5"    — cheapest,     ~$1/M in,  $5/M out
+model = "claude-opus-4-7"
+max_tokens = 64000              # per-turn output ceiling; includes thinking tokens
+
+[agent]
+effort = "medium"               # "medium" is the safe default; "high" can hang on hardest files
+thinking_budget_tokens = 0      # 0 = adaptive (recommended); >0 = hard cap in tokens
+max_budget_tokens = 3_000_000   # dollar cap derived from this @ Opus rates (~$75)
+max_tool_calls = 500
+max_wall_seconds = 5400

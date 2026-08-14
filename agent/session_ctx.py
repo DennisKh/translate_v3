@@ -59,14 +59,6 @@ class SessionContext:
     # caps spend in dollars). Starts at `cfg.agent.max_budget_tokens`.
     remaining_task_tokens: int = 0
 
-    # Polish-session completion signal. Set by the `finish_polish` tool
-    # when the model explicitly declares polish work done. `_run_one_session`
-    # in polish mode checks this after each turn and returns when true.
-    # Reset at the start of each polish session.
-    polish_finished: bool = False
-    polish_finish_summary: str = ""
-    polish_finish_unfixable: tuple[str, ...] = ()
-
     # Polish-mode read-loop breaker. `read_elixir` is a low-risk tool the
     # model prefers under tool_choice="any"; observed behavior is 12+ reads
     # with zero edits. This counter tracks read_elixir calls since the last
@@ -74,14 +66,6 @@ class SessionContext:
     # refuses and directs the model to edit or finish. Reset on any edit.
     polish_active: bool = False
     polish_reads_since_edit: int = 0
-
-    # Phase A completion signal. Set by the `finish_translate` tool when the
-    # model explicitly declares translation complete. Under Phase A's
-    # `tool_choice="any"`, this is the only way to end the session — model
-    # cannot emit pure `end_turn`, which was the root cause of the
-    # "empty structured output → pydantic.ValidationError crash" bug.
-    phase_a_finished: bool = False
-    phase_a_summary: str = ""
 
     @property
     def source_root(self) -> Path:

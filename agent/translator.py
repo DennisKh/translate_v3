@@ -1,22 +1,21 @@
 """TranslationAgent — writes Elixir, validates in-loop, terminates via sentinel.
 
-Uses the Anthropic Tool Runner. Every session runs under
-`tool_choice="any"` + a `finish_translate` / `finish_polish` sentinel tool
-— the only way for the model to end the session is by calling that tool
-(and passing its non-terminal-files check). This structural constraint
-eliminates the "model emits end_turn before work is done" failure class.
+Uses LangGraph (edge-driven agentic loop) with LangChain's ChatModel abstraction.
+Every session runs a compiled StateGraph under `tool_choice="any"` (when the provider
+supports it) + a `finish_translate` / `finish_polish` sentinel tool — the only way
+for the model to end the session is by calling that tool (and passing its
+non-terminal-files check). This structural constraint eliminates the "model emits
+end_turn before work is done" failure class.
 
 Key subsystems (all belt-and-suspenders, so an isolated failure never
 kills a run that has completed on-disk work):
 
-  - **Adaptive thinking + effort** (`thinking={"type": "adaptive"}`) with
-    an optional `thinking_budget_tokens` hard cap for reproducibility.
-  - **Prompt caching** on the system prompt + tool schemas.
-  - **Task Budget** (Opus 4.7 beta) — model-visible token countdown.
-  - **Per-turn timeout** (`max_turn_seconds`) — kills a hung API call
-    without crashing the run.
+  - **Adaptive thinking + effort** — configured per provider in agent/llm.py.
+  - **Prompt caching** on the system prompt (Anthropic-specific perk, applied
+    at session init via apply_prompt_cache).
+  - **Per-turn timeout** — the underlying ChatModel's timeout setting.
   - **Session-reset checkpointing** — after N files or M tokens, snapshot
-    state to disk and start a fresh session with the state summary as
+    state to disk and start a fresh graph run with the state summary as
     seed (no conversation history). Long sessions degrade; short cache-
     warm sessions produce better output.
   - **Graceful budget shutdown** — at 90% of any cap, inject a wrap-up
@@ -41,17 +40,23 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
-import anthropic
 import pydantic
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from pydantic import BaseModel, Field
 
-from agent.cost import TurnUsage
+from agent.graph import AgentState, build_polish_graph, build_translation_graph
+from agent.llm import (
+    ChatModelBundle,
+    ExceptionKind,
+    apply_prompt_cache,
+    classify_exception,
+    turn_usage_from_ai_message,
+)
 from agent.mix_ops import mix_compile, mix_credo, mix_format
 from agent.session_ctx import SessionContext
 from agent.state import FileState
-from agent.tools import build_tools
 
 
 # ---------------------------------------------------------------------------
@@ -102,11 +107,6 @@ _MAX_RATE_LIMIT_STREAK = 3
 # Graceful shutdown thresholds (per-run)
 _BUDGET_WARN_PCT = 90.0
 
-# Per-turn cap. Under the finish_translate sentinel design, no single turn
-# emits a giant structured JSON — writes are surgical, edits are diffs. But
-# 64K keeps headroom for the rare large-file write on the first pass.
-_MAX_TOKENS_PER_TURN = 64_000
-
 # Nudge the agent to compile after this many writes without one
 _COMPILE_NUDGE_THRESHOLD = 5
 
@@ -120,8 +120,9 @@ _HEARTBEAT_SECONDS = 60
 class _Heartbeat:
     """Background thread that logs periodic 'still waiting' notices.
 
-    Started before iterating the runner (before we block on the next model
-    message); stopped after the message arrives. Bounded by _HEARTBEAT_SECONDS.
+    Started before iterating the graph stream (before we block on the next
+    model message); stopped after the stream completes or is broken.
+    Bounded by _HEARTBEAT_SECONDS.
     """
 
     def __init__(self, ctx: SessionContext, session_num: int, turn_num: int) -> None:
@@ -147,7 +148,7 @@ class _Heartbeat:
             elapsed = int(time.monotonic() - self._start_time)
             self._ctx.events.emit(
                 "info",
-                message=f"⏳ still waiting on model (session #{self._session}, "
+                message=f"still waiting on model (session #{self._session}, "
                         f"turn {self._turn + 1}, {elapsed}s elapsed) — "
                         f"large files can take several minutes",
             )
@@ -155,16 +156,6 @@ class _Heartbeat:
 
 def _load_system_prompt() -> str:
     return (_PROMPTS_DIR / "translator_system.md").read_text()
-
-
-def _turn_usage(message: Any) -> TurnUsage:
-    u = message.usage
-    return TurnUsage(
-        input_tokens=getattr(u, "input_tokens", 0) or 0,
-        output_tokens=getattr(u, "output_tokens", 0) or 0,
-        cache_write_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
-        cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -458,293 +449,289 @@ def _build_polish_message(
     )
 
 
-def _wrap_up_message(reason: str) -> dict:
+def _wrap_up_message(reason: str) -> HumanMessage:
     """Injected mid-session when budget is at 90%. Asks the agent to finish
     what it's on and stop, rather than start another file."""
-    return {
-        "role": "user",
-        "content": (
-            f"**Budget warning:** {reason}\n\n"
-            f"Do NOT start work on a new file. Finish any in-progress writes, "
-            f"run `validation_status()` one final time, and return the "
-            f"structured summary. If you have unresolved blockers, list them "
-            f"in the outcome — do not try to fix them now."
-        ),
-    }
+    return HumanMessage(content=(
+        f"**Budget warning:** {reason}\n\n"
+        f"Do NOT start work on a new file. Finish any in-progress writes, "
+        f"run `validation_status()` one final time, and return the "
+        f"structured summary. If you have unresolved blockers, list them "
+        f"in the outcome — do not try to fix them now."
+    ))
 
 
-def _bomb_nudge_message(files_written: int) -> dict:
+def _bomb_nudge_message(files_written: int) -> HumanMessage:
     """Injected when the agent writes many files without compiling."""
-    return {
-        "role": "user",
-        "content": (
-            f"**Reminder:** you've written {files_written} files since the last "
-            f"`mix_compile_tool()`. Cross-file drift accumulates silently. "
-            f"Please call `mix_compile_tool()` now to catch broken references "
-            f"before they compound."
-        ),
-    }
-
-
-# NOTE: `_is_premature_end` / `_premature_end_bounce` were removed after the
-# `finish_translate` sentinel migration. The bounce mechanism attempted to
-# `runner.append_messages(...)` after `end_turn` — but the SDK's `__run__`
-# returns immediately when `end_turn` fires, so queued messages were never
-# consumed. That's fixed structurally now: `tool_choice="any"` prevents
-# `end_turn`, and `finish_translate` refuses at the tool boundary when files
-# are non-terminal. See §17.7 of PLAN.md.
+    return HumanMessage(content=(
+        f"**Reminder:** you've written {files_written} files since the last "
+        f"`mix_compile_tool()`. Cross-file drift accumulates silently. "
+        f"Please call `mix_compile_tool()` now to catch broken references "
+        f"before they compound."
+    ))
 
 
 # ---------------------------------------------------------------------------
-# One-session runner
+# One-session LangGraph runner
 # ---------------------------------------------------------------------------
 
-def _run_one_session(
+class GraphSessionResult(NamedTuple):
+    outcome: TranslationOutcome | None
+    reason: str
+    finish_summary: str
+    finish_unfixable: tuple[str, ...]
+
+
+class _ChunkAction(NamedTuple):
+    """Return value from per-chunk handlers.
+
+    Exactly one of the three fields is non-None:
+      - `terminate` — end the session and return this result to the caller
+      - `inject`    — break the current stream, append this HumanMessage,
+                      restart graph.stream() with the accumulated messages
+      - all None    — continue consuming the current stream
+
+    Encoded as a NamedTuple (not an Enum + payload) so the caller reads
+    `action.terminate` / `action.inject` directly without pattern-match
+    boilerplate.
+    """
+    terminate: GraphSessionResult | None = None
+    inject: HumanMessage | None = None
+
+
+_CONTINUE = _ChunkAction()
+
+_EMPTY_TOOL_CALLS_NUDGE = HumanMessage(
+    content=(
+        "You must call a tool. To translate a Java file, "
+        "call `write_elixir(module_or_path, contents)`. "
+        "To end the session, call `finish_translate(summary)`. "
+        "Return a tool call, not a text response."
+    )
+)
+
+
+def _record_turn_usage(
+    ctx: SessionContext,
+    stats: "_SessionStats",
+    last_msg: AIMessage,
+    session_num: int,
+) -> None:
+    """Apply per-turn policy-layer accounting for an agent-node chunk.
+
+    `ctx.cost.add_turn(usage)` is already called inside `agent_node` (graph.py);
+    calling it here would double-count. This function only touches the counters
+    that live outside the graph: budget dollars, task tokens, rate-limit streak,
+    session stats, and the `turn` event.
+    """
+    usage = turn_usage_from_ai_message(last_msg)
+    session_tokens_this_turn = (
+        usage.input_tokens + usage.output_tokens
+        + usage.cache_write_tokens + usage.cache_read_tokens
+    )
+    stats.session_tokens += session_tokens_this_turn
+    ctx.budget.add_usage(usage, ctx.cfg.llm.model)
+    ctx.remaining_task_tokens = max(
+        0, ctx.remaining_task_tokens - session_tokens_this_turn
+    )
+    ctx.rate_limit_streak = 0
+
+    ctx.events.emit(
+        "turn",
+        session=session_num,
+        turn=stats.turns,
+        tokens={
+            "input": usage.input_tokens,
+            "output": usage.output_tokens,
+            "cache_read": usage.cache_read_tokens,
+            "cache_write": usage.cache_write_tokens,
+        },
+        cumulative_cost_usd=ctx.cost.cumulative_cost_usd(),
+        budget_remaining_pct=ctx.budget.remaining_pct(),
+        remaining_task_tokens=ctx.remaining_task_tokens,
+    )
+
+
+def _process_agent_chunk(
     ctx: SessionContext,
     *,
-    client: anthropic.Anthropic,
-    system_prompt: str,
-    tools: list,
-    initial_message: str,
+    last_msg: AIMessage,
+    stats: "_SessionStats",
     session_num: int,
-    polish_mode: bool = False,
-) -> tuple[TranslationOutcome | None, str]:
-    """Run one Tool Runner session. Returns (outcome, reason_ended).
+    polish_mode: bool,
+    bundle: ChatModelBundle,
+    empty_response_state: list[int],
+) -> _ChunkAction:
+    """Handle one agent-node chunk (last message is AIMessage).
 
-    reason_ended is one of:
-      - "end_turn"          — model finished normally
-      - "budget_hit"        — Python-side dollar/tool-call/wall cap
-      - "checkpoint"        — session-reset threshold reached (loop restarts)
-      - "rate_limit_soft"   — hit a 429/529; caller SHOULD retry with a new session
-      - "rate_limit_hard"   — streak exceeded, abort the whole run
-      - "exhausted"         — max_iterations reached; loop restarts
+    `empty_response_state` is a single-element list used as a mutable cell so
+    the caller can share the nudge-attempt counter across chunks without
+    packaging it in another dataclass. Bounded to 1 nudge.
+
+    Returns a `_ChunkAction`. Cannot inject after this branch — the pending
+    AIMessage(tool_calls) requires a matching ToolMessage before any
+    HumanMessage may follow (OpenAI strict pairing). Injection paths for
+    soft-budget / compile-nudge live in `_process_tool_chunk`.
     """
-    if ctx.cfg.agent.max_budget_tokens < 20_000:
-        raise ValueError(
-            f"max_budget_tokens={ctx.cfg.agent.max_budget_tokens:,} below the "
-            f"20,000 minimum required by Task Budget beta"
-        )
+    stats.turns += 1
+    if stats.turns == 1:
+        stats.note_first_turn(ctx)
 
-    # Reset per-session counters ON THE CTX (not on _SessionStats) so they're
-    # accurate for the LOOP as it enters this session. `files_written_since_compile`
-    # is a project-wide counter — it should reflect real state as we enter,
-    # not accumulate stale carryover from a previous session that never compiled.
-    # The compile-nudge fires only when THIS session's writes exceed the threshold.
-    ctx.files_written_since_compile = 0
+    _record_turn_usage(ctx, stats, last_msg, session_num)
 
-    output_config: dict[str, Any] = {"effort": ctx.cfg.agent.effort}
-    # Task Budget requires task-budgets-2026-03-13 (Opus 4.7 only).
-    # NOTE: `context_management` (clear_tool_uses) was REMOVED — testing showed
-    # it broke prompt caching (rewrote message history → cache prefix hash
-    # invalidated). One turn that should have been cache-warm ate $0.21 in
-    # input costs. Better to let the session hit the reset threshold naturally
-    # and start a fresh session (cache-cold once, then warm).
-    betas: list[str] = []
-    if ctx.cfg.safety.task_budget_beta and ctx.cfg.agent.model.startswith("claude-opus-4-7"):
-        remaining = max(20_000, ctx.remaining_task_tokens)
-        output_config["task_budget"] = {"type": "tokens", "total": remaining}
-        betas.append("task-budgets-2026-03-13")
-
-    # Thinking config — either explicit budget (hard cap) or adaptive.
-    # Sonnet 4.6 with adaptive+high-effort produced 30-min single-turn hangs.
-    # Explicit budget lets the operator prevent runaway deliberation.
-    if ctx.cfg.agent.thinking_budget_tokens > 0:
-        thinking_config: dict[str, Any] = {
-            "type": "enabled",
-            "budget_tokens": ctx.cfg.agent.thinking_budget_tokens,
-        }
-    else:
-        thinking_config = {"type": "adaptive"}
-
-    runner_kwargs: dict[str, Any] = dict(
-        model=ctx.cfg.agent.model,
-        max_tokens=_MAX_TOKENS_PER_TURN,
-        thinking=thinking_config,
-        output_config=output_config,
-        max_iterations=200,
-        # Per-turn wall-clock timeout — kills a single API call if it exceeds
-        # the configured ceiling. Prevents 30-min hangs.
-        timeout=ctx.cfg.agent.max_turn_seconds,
-        system=[{
-            "type": "text",
-            "text": system_prompt,
-            "cache_control": {"type": "ephemeral"},
-        }],
-        tools=tools,
-        messages=[{"role": "user", "content": initial_message}],
-    )
-    if polish_mode:
-        # Force tool use — model cannot emit pure end_turn. Must call a tool
-        # every turn, including the `finish_polish` sentinel to end. Skip
-        # `output_format` since polish outcome comes from finish_polish's
-        # args, not a structured final message.
-        runner_kwargs["tool_choice"] = {"type": "any"}
-        ctx.polish_finished = False
-        ctx.polish_finish_summary = ""
-        ctx.polish_finish_unfixable = ()
-        ctx.polish_active = True
-        ctx.polish_reads_since_edit = 0
-    else:
-        # Phase A main mode: same structural constraint as polish. The old
-        # design used `output_format=TranslationOutcome` (structured output)
-        # which was fragile — Sonnet with adaptive thinking on long sessions
-        # occasionally emitted an empty text block, crashing Pydantic's JSON
-        # parser at the SDK boundary. `finish_translate` sentinel + tool_choice
-        # "any" avoids that failure class entirely: outcome comes from tool
-        # args (which are typed and validated at call time), not from a
-        # final text message.
-        runner_kwargs["tool_choice"] = {"type": "any"}
-        ctx.phase_a_finished = False
-        ctx.phase_a_summary = ""
-    if betas:
-        runner_kwargs["betas"] = betas
-
-    runner = client.beta.messages.tool_runner(**runner_kwargs)
-    stats = _SessionStats()
-    final_outcome: TranslationOutcome | None = None
-
-    # Use an explicit iterator so we can start/stop a heartbeat around each
-    # blocking wait for the next model message. Without this, the user sees
-    # dead silence during large-file generation (5-15 minutes on the hardest
-    # files) and can't tell if it's stuck.
-    runner_iter = iter(runner)
-
-    try:
-        while True:
-            heartbeat = _Heartbeat(ctx, session_num, stats.turns)
-            heartbeat.start()
-            try:
-                message = next(runner_iter)
-            except StopIteration:
-                heartbeat.stop()
-                break
-            finally:
-                heartbeat.stop()
-
-            stats.turns += 1
-            # Capture start-completed count AFTER the first turn so any
-            # promotions from an initial mix_compile don't count against
-            # this session's threshold.
-            if stats.turns == 1:
-                stats.note_first_turn(ctx)
-
-            usage = _turn_usage(message)
-            session_tokens_this_turn = (usage.input_tokens + usage.output_tokens
-                                        + usage.cache_write_tokens + usage.cache_read_tokens)
-            stats.session_tokens += session_tokens_this_turn
-            ctx.cost.add_turn(usage)
-            ctx.budget.add_usage(usage, ctx.cfg.agent.model)
-            # Deduct from the raw remaining-tokens counter (Task Budget)
-            ctx.remaining_task_tokens = max(0, ctx.remaining_task_tokens - session_tokens_this_turn)
-            # Successful turn — reset the rate-limit streak
-            ctx.rate_limit_streak = 0
-
+    # Model emitted no tool calls (end_turn).
+    # For providers without forced tool use (Ollama), try once to nudge the
+    # model back onto the tool-calling path. For providers with forced tool
+    # use (Anthropic/OpenAI) this branch is the defensive fallback (§5.4).
+    if not last_msg.tool_calls:
+        if not bundle.forces_tool_call and empty_response_state[0] < 1:
+            empty_response_state[0] += 1
             ctx.events.emit(
-                "turn",
-                session=session_num,
-                turn=stats.turns,
-                tokens={
-                    "input": usage.input_tokens,
-                    "output": usage.output_tokens,
-                    "cache_read": usage.cache_read_tokens,
-                    "cache_write": usage.cache_write_tokens,
-                },
-                cumulative_cost_usd=ctx.cost.cumulative_cost_usd(),
-                budget_remaining_pct=ctx.budget.remaining_pct(),
-                remaining_task_tokens=ctx.remaining_task_tokens,
-                stop_reason=message.stop_reason,
+                "warn",
+                message=f"model returned no tool calls (attempt "
+                        f"{empty_response_state[0]}/2) — nudging",
             )
+            return _ChunkAction(inject=_EMPTY_TOOL_CALLS_NUDGE)
+        ctx.events.emit(
+            "warn",
+            message="end_turn with no tool calls — "
+                    "synthesizing outcome from disk state",
+        )
+        return _ChunkAction(terminate=GraphSessionResult(None, "end_turn", "", ()))
 
-            # Polish-mode terminal: `finish_polish` tool invoked.
-            if polish_mode and ctx.polish_finished:
-                ctx.events.emit(
-                    "info",
-                    message=f"polish: finish_polish invoked "
-                            f"({len(ctx.polish_finish_unfixable)} unfixable declared)",
-                )
-                return final_outcome, "finish_polish"
+    # Hard budget cap — stop the run entirely. Returns immediately (no
+    # injection) — safe from any message branch.
+    if reason := ctx.budget.status():
+        ctx.events.emit("warn", message=f"cap reached: {reason}")
+        return _ChunkAction(terminate=GraphSessionResult(None, "budget_hit", "", ()))
 
-            # Main-mode terminal: `finish_translate` tool invoked. The tool
-            # implementation refuses when files are still non-terminal —
-            # the model gets a tool-result error and retries — so by the
-            # time we see phase_a_finished=True, all files are addressed.
-            if not polish_mode and ctx.phase_a_finished:
-                ctx.events.emit(
-                    "info",
-                    message=f"Phase A: finish_translate invoked — "
-                            f"{len(ctx.state.all())} files addressed",
-                )
-                return final_outcome, "finish_translate"
+    # Session-reset checkpoint — main-mode only. Returns immediately (starts
+    # a fresh session), so the pending tool_calls in this AIMessage are never
+    # executed. The next session sees list_files(status="untranslated") still
+    # showing those files and re-attempts. write_elixir is idempotent, so
+    # this is semantically safe even if some writes were lost.
+    if not polish_mode and (reason := stats.should_reset(ctx)):
+        ctx.events.emit("checkpoint", session=session_num, message=reason)
+        return _ChunkAction(terminate=GraphSessionResult(None, "checkpoint", "", ()))
 
-            # Defensive fallback for `end_turn`. Under `tool_choice="any"`
-            # the API should not yield this stop_reason — the model must
-            # invoke a tool every turn. If it fires anyway (SDK edge case,
-            # provider behavior change), accept it and let the outer loop
-            # synthesize outcome from disk state. Non-terminal files show
-            # up as `remaining_blockers` in the final report.
-            if message.stop_reason == "end_turn":
-                ctx.events.emit(
-                    "warn",
-                    message="unexpected end_turn under tool_choice='any' — "
-                            "synthesizing outcome from disk state",
-                )
-                return final_outcome, "end_turn"
+    # Soft budget warning and compile nudge are handled in _process_tool_chunk.
+    # Injecting a HumanMessage after an AIMessage(tool_calls) would violate the
+    # tool_call → tool_result pairing invariant and trigger a 400 from OpenAI.
+    return _CONTINUE
 
-            # Hard budget cap
-            if reason := ctx.budget.status():
-                ctx.events.emit("warn", message=f"cap reached: {reason}")
-                return final_outcome, "budget_hit"
 
-            # Soft budget warning — inject wrap-up message ONCE. Main-mode
-            # only; the polish-mode wrap-up message talks about translation
-            # and would confuse the model.
-            if (not polish_mode
-                    and not stats.warned_on_budget
-                    and ctx.budget.remaining_pct() < (100 - _BUDGET_WARN_PCT)):
-                stats.warned_on_budget = True
-                warn = (f"{ctx.budget.remaining_pct():.0f}% budget remaining "
-                        f"(cost ${ctx.cost.cumulative_cost_usd():.2f} USD)")
-                ctx.events.emit("warn", message=f"soft budget warning: {warn}")
-                runner.append_messages(_wrap_up_message(warn))
-                continue
+def _process_tool_chunk(
+    ctx: SessionContext,
+    *,
+    chunk: dict,
+    stats: "_SessionStats",
+    session_num: int,
+    polish_mode: bool,
+    sentinel_reason: str,
+) -> _ChunkAction:
+    """Handle one tools-node chunk (last message is ToolMessage).
 
-            # Compile-nudge — main-mode only. The counter tracks translation
-            # writes, not polish edits; irrelevant during polish.
-            if (not polish_mode
-                    and not stats.nudged_on_compile
-                    and ctx.files_written_since_compile >= _COMPILE_NUDGE_THRESHOLD):
-                stats.nudged_on_compile = True
-                ctx.events.emit(
-                    "info",
-                    message=f"nudging model to compile "
-                            f"({ctx.files_written_since_compile} writes this session without one)",
-                )
-                runner.append_messages(_bomb_nudge_message(ctx.files_written_since_compile))
-                continue
+    The tool_call pairing invariant is closed here (AIMessage(tool_calls) →
+    ToolMessage has completed), so HumanMessage injection is safe.
+    """
+    if chunk.get("finish_called"):
+        finish_summary = chunk.get("finish_summary", "")
+        finish_unfixable = chunk.get("finish_unfixable", ())
+        if polish_mode:
+            addendum = f"unfixable: {len(finish_unfixable)}"
+        else:
+            addendum = f"{len(ctx.state.all())} files addressed"
+        ctx.events.emit(
+            "info",
+            message=f"{sentinel_reason} invoked — {addendum}",
+        )
+        return _ChunkAction(terminate=GraphSessionResult(
+            None, sentinel_reason, finish_summary, finish_unfixable,
+        ))
 
-            # Session-reset checkpoint — main-mode only. Polish sessions
-            # deliberately run without checkpointing: a mid-polish restart
-            # would drop conversational context and force the model to
-            # re-explore, doubling cost with no benefit.
-            if not polish_mode and (reason := stats.should_reset(ctx)):
-                ctx.events.emit("checkpoint", session=session_num, message=reason)
-                return final_outcome, "checkpoint"
+    if not polish_mode and _should_warn_on_budget(ctx, stats):
+        stats.warned_on_budget = True
+        warn = (f"{ctx.budget.remaining_pct():.0f}% budget remaining "
+                f"(cost ${ctx.cost.cumulative_cost_usd():.2f} USD)")
+        ctx.events.emit("warn", message=f"soft budget warning: {warn}")
+        _assert_pairing_closed(chunk, "wrap-up")
+        return _ChunkAction(inject=_wrap_up_message(warn))
 
-    except (anthropic.APITimeoutError, anthropic.APIConnectionError) as exc:
-        # Per-turn wall-clock timeout hit. This usually means the model got
-        # stuck in a deep-think loop on a huge file. Best recovery: kill this
-        # session, let the outer loop start a fresh one with cold context —
-        # the model will approach the same file with less accumulated context
-        # weight and (hopefully) commit to smaller units.
+    if not polish_mode and _should_nudge_compile(ctx, stats):
+        stats.nudged_on_compile = True
+        ctx.events.emit(
+            "info",
+            message=f"nudging model to compile "
+                    f"({ctx.files_written_since_compile} writes "
+                    f"this session without one)",
+        )
+        _assert_pairing_closed(chunk, "compile-nudge")
+        return _ChunkAction(inject=_bomb_nudge_message(ctx.files_written_since_compile))
+
+    return _CONTINUE
+
+
+def _should_warn_on_budget(ctx: SessionContext, stats: "_SessionStats") -> bool:
+    return (not stats.warned_on_budget
+            and ctx.budget.remaining_pct() < (100 - _BUDGET_WARN_PCT))
+
+
+def _should_nudge_compile(ctx: SessionContext, stats: "_SessionStats") -> bool:
+    return (not stats.nudged_on_compile
+            and ctx.files_written_since_compile >= _COMPILE_NUDGE_THRESHOLD)
+
+
+def _assert_pairing_closed(chunk: dict, inject_label: str) -> None:
+    """Defensive: last message must be ToolMessage before HumanMessage inject.
+
+    Belt-and-suspenders — if LangGraph's stream_mode='values' semantics ever
+    change (e.g. an agent-chunk yields with the tool-message already appended),
+    this fails loud instead of silently regressing the OpenAI 400 pairing bug.
+    """
+    assert isinstance(chunk["messages"][-1], ToolMessage), (
+        f"BUG: {inject_label} inject attempted when last message is not "
+        f"ToolMessage — tool_call pairing invariant violated"
+    )
+
+
+def _handle_stream_exception(
+    ctx: SessionContext,
+    exc: BaseException,
+    session_num: int,
+) -> GraphSessionResult:
+    """Map an exception raised inside `graph.stream()` to a GraphSessionResult.
+
+    `pydantic.ValidationError` is treated distinctly as "parse_failure" because
+    it's not a provider SDK error — `classify_exception` would map it to UNKNOWN,
+    which loses the semantic that the model produced malformed structured output.
+
+    Provider SDK exceptions go through `agent.llm.classify_exception` to get a
+    provider-agnostic `ExceptionKind` and dispatch:
+      TIMEOUT               → checkpoint (fresh session)
+      RATE_LIMIT/TRANSIENT  → soft retry; hard-abort after streak of N
+      BAD_REQUEST/AUTH      → re-raise (user config bug)
+      UNKNOWN               → parse_failure (synthesize from disk)
+    """
+    if isinstance(exc, pydantic.ValidationError):
+        ctx.events.emit(
+            "error",
+            message=f"structured parse failed at session "
+                    f"{session_num}: {type(exc).__name__} — treating as "
+                    f"parse_failure, will synthesize from disk state",
+        )
+        return GraphSessionResult(None, "parse_failure", "", ())
+
+    kind = classify_exception(exc)
+
+    if kind == ExceptionKind.TIMEOUT:
         ctx.events.emit(
             "warn",
             message=f"per-turn timeout ({ctx.cfg.agent.max_turn_seconds}s) — "
                     f"treating as checkpoint: {type(exc).__name__}: {exc}",
         )
-        return final_outcome, "checkpoint"
-    except (anthropic.RateLimitError, anthropic.InternalServerError) as exc:
-        # Note: `InternalServerError` also covers `OverloadedError` (529)
-        # since the SDK subclasses it. Both are transient — treat identically.
+        return GraphSessionResult(None, "checkpoint", "", ())
+
+    if kind in (ExceptionKind.RATE_LIMIT, ExceptionKind.TRANSIENT):
         ctx.rate_limit_streak += 1
         streak = ctx.rate_limit_streak
         ctx.events.emit(
@@ -757,46 +744,136 @@ def _run_one_session(
                 "error",
                 message=f"aborting: {_MAX_RATE_LIMIT_STREAK} transient failures in a row",
             )
-            return final_outcome, "rate_limit_hard"
-        # Soft — outer loop should retry with a new session
-        return final_outcome, "rate_limit_soft"
-    except pydantic.ValidationError as exc:
-        # SDK's structured-output parser threw. Common cause: model emitted
-        # an empty text block or malformed JSON for the final structured
-        # message (observed at session #10 of a long run — the model got
-        # confused and returned '' where a TranslationOutcome was expected).
-        # Treat as a soft failure — the outer loop will synthesize outcome
-        # from disk state, preserving whatever translated files we have.
-        ctx.events.emit(
-            "error",
-            message=f"structured-output parse failed at session "
-                    f"{session_num}: {type(exc).__name__} — treating as "
-                    f"parse_failure, will synthesize from disk state",
-        )
-        return final_outcome, "parse_failure"
-    except anthropic.APIError as exc:
+            return GraphSessionResult(None, "rate_limit_hard", "", ())
+        return GraphSessionResult(None, "rate_limit_soft", "", ())
+
+    if kind in (ExceptionKind.BAD_REQUEST, ExceptionKind.AUTH):
         ctx.events.emit("error", message=f"API error: {type(exc).__name__}: {exc}")
-        raise
+        raise exc
+
+    # ExceptionKind.UNKNOWN — log and treat as parse_failure so the outer
+    # loop can synthesize from disk.
+    ctx.events.emit(
+        "error",
+        message=f"unexpected session error: {type(exc).__name__}: {exc} "
+                f"— treating as parse_failure",
+    )
+    return GraphSessionResult(None, "parse_failure", "", ())
+
+
+def _run_one_graph_session(
+    ctx: SessionContext,
+    *,
+    bundle: ChatModelBundle,
+    graph: Any,
+    initial_messages: list,
+    session_num: int,
+    polish_mode: bool = False,
+) -> GraphSessionResult:
+    """Run one LangGraph session. Returns GraphSessionResult(outcome, reason, finish_summary, finish_unfixable).
+
+    reason is one of:
+      - "finish_translate"  — sentinel tool accepted; main-mode done
+      - "finish_polish"     — sentinel tool accepted; polish-mode done
+      - "end_turn"          — model finished without tool calls (Ollama / defensive)
+      - "budget_hit"        — Python-side dollar/tool-call/wall cap
+      - "checkpoint"        — session-reset threshold reached (loop restarts)
+      - "rate_limit_soft"   — hit a 429/529; caller SHOULD retry with a new session
+      - "rate_limit_hard"   — streak exceeded, abort the whole run
+      - "parse_failure"     — pydantic.ValidationError or UNKNOWN exception
+      - "exhausted"         — graph stream ended without sentinel
+
+    Uses stream_mode='values' — each chunk is the full AgentState after a node
+    fires. The agent-chunk (last message is AIMessage) is a model turn; the
+    tools-chunk (last message is ToolMessage) follows. Per-turn budget
+    accounting happens on each agent-chunk. Soft budget warn / compile nudge
+    inject a HumanMessage into the state (in the ToolMessage branch, to preserve
+    the tool_call → tool_result pairing invariant) and restart the stream.
+
+    `ctx.cost.add_turn(usage)` is called inside agent_node (graph.py). Do NOT
+    call it here — that would double-count cost. This runner calls
+    `ctx.budget.add_usage`, `ctx.remaining_task_tokens`, and
+    `ctx.rate_limit_streak` (the policy-layer counters that live outside
+    the graph).
+    """
+    ctx.files_written_since_compile = 0
+    if polish_mode:
+        ctx.polish_active = True
+        ctx.polish_reads_since_edit = 0
+
+    stats = _SessionStats()
+    sentinel_reason = "finish_polish" if polish_mode else "finish_translate"
+    current_messages = list(initial_messages)
+    # Mutable single-element cell so _process_agent_chunk can increment the
+    # nudge-attempt counter without threading it back through a return value.
+    # Bounded to 1 nudge (see _process_agent_chunk).
+    empty_response_state = [0]
+
+    try:
+        while True:
+            state: AgentState = {
+                "messages": current_messages,
+                "finish_called": False,
+                "finish_summary": "",
+                "finish_unfixable": (),
+            }
+
+            heartbeat = _Heartbeat(ctx, session_num, stats.turns)
+            heartbeat.start()
+            last_chunk: dict | None = None
+            action = _CONTINUE
+
+            try:
+                for chunk in graph.stream(state, stream_mode="values"):
+                    last_chunk = chunk
+                    last_msg = chunk["messages"][-1] if chunk["messages"] else None
+                    if last_msg is None:
+                        continue
+
+                    if isinstance(last_msg, AIMessage):
+                        action = _process_agent_chunk(
+                            ctx, last_msg=last_msg, stats=stats,
+                            session_num=session_num, polish_mode=polish_mode,
+                            bundle=bundle,
+                            empty_response_state=empty_response_state,
+                        )
+                    elif isinstance(last_msg, ToolMessage):
+                        action = _process_tool_chunk(
+                            ctx, chunk=chunk, stats=stats,
+                            session_num=session_num, polish_mode=polish_mode,
+                            sentinel_reason=sentinel_reason,
+                        )
+                    else:
+                        continue
+
+                    if action.terminate is not None:
+                        return action.terminate
+                    if action.inject is not None:
+                        break
+            finally:
+                heartbeat.stop()
+
+            # Broke out of the stream to inject a message: append it to the
+            # accumulated messages and loop again with a new graph.stream().
+            if action.inject is not None:
+                assert last_chunk is not None, "inject requires at least one chunk"
+                current_messages = list(last_chunk["messages"]) + [action.inject]
+                continue
+
+            # Stream ended without a sentinel or explicit break. Either the
+            # graph reached END via the no-tool-calls defensive branch
+            # (handled above by the end_turn check in the agent chunk)
+            # or the graph exhausted iterations somehow.
+            ctx.events.emit(
+                "warn",
+                message=f"session {session_num} graph stream ended without sentinel",
+            )
+            return GraphSessionResult(None, "exhausted", "", ())
     except Exception as exc:  # noqa: BLE001
-        # Last-resort safety net. Never let an unexpected exception in the
-        # SDK, tool code, or parser abort the run when we have persisted
-        # translation state on disk. Log loudly, hand off to the outer loop.
-        ctx.events.emit(
-            "error",
-            message=f"unexpected session error: {type(exc).__name__}: {exc} "
-                    f"— treating as parse_failure",
-        )
-        return final_outcome, "parse_failure"
+        return _handle_stream_exception(ctx, exc, session_num)
     finally:
-        # Clear polish-mode flags so subsequent non-polish sessions don't
-        # inherit the read-cap logic.
         if polish_mode:
             ctx.polish_active = False
-
-    # Runner naturally exhausted (max_iterations hit) without end_turn
-    ctx.events.emit("warn",
-                    message=f"session {session_num} exhausted iterations without end_turn")
-    return final_outcome, "exhausted"
 
 
 # ---------------------------------------------------------------------------
@@ -806,19 +883,18 @@ def _run_one_session(
 def run_translator_phase2(
     ctx: SessionContext,
     *,
-    client: anthropic.Anthropic,
+    bundle: ChatModelBundle,
     dry_run: bool = False,
 ) -> tuple[TranslationOutcome | None, int]:
     """Multi-session translation loop. Returns (outcome, session_count).
 
-    Each individual session runs Tool Runner until it hits a terminal state
-    (end_turn, budget cap, checkpoint threshold, transient failure, or
-    max_iterations exhaustion). The outer loop restarts sessions on
-    "checkpoint", "rate_limit_soft", and "exhausted"; breaks on "end_turn",
+    Each individual session runs a LangGraph StateGraph until it hits a terminal
+    state (sentinel tool, budget cap, checkpoint threshold, transient failure,
+    or graph exhaustion). The outer loop restarts sessions on "checkpoint",
+    "rate_limit_soft", and "exhausted"; breaks on "finish_translate",
     "budget_hit", "rate_limit_hard".
     """
     system_prompt = _load_system_prompt()
-    tools = build_tools(ctx, include_write=True)
 
     # Initialize the Task Budget remaining-tokens tracker
     ctx.remaining_task_tokens = ctx.cfg.agent.max_budget_tokens
@@ -832,7 +908,7 @@ def run_translator_phase2(
 
     ctx.events.emit(
         "phase_start", phase="translate",
-        message=f"Phase 2 translation — {len(tools)} tools loaded, "
+        message=f"Phase 2 translation — "
                 f"system prompt {len(system_prompt):,} chars, "
                 f"{len(ctx.java_classes)} files to translate, "
                 f"up to {total_sessions_cap} sessions",
@@ -844,16 +920,11 @@ def run_translator_phase2(
                         message="dry-run OK — prompt and tools load cleanly")
         return None, 0
 
-    thinking_desc = (
-        f"budget={ctx.cfg.agent.thinking_budget_tokens:,}"
-        if ctx.cfg.agent.thinking_budget_tokens > 0 else "adaptive"
-    )
     ctx.events.emit(
         "info",
-        message=f"model={ctx.cfg.agent.model} effort={ctx.cfg.agent.effort} "
-                f"thinking={thinking_desc} "
+        message=f"model={ctx.cfg.llm.model} "
                 f"budget={ctx.cfg.agent.max_budget_tokens:,} tokens "
-                f"(hard cap ≈ ${ctx.budget._max_cost_usd:.2f}) "  # noqa: SLF001
+                f"(hard cap ≈ ${ctx.budget._max_cost_usd:.2f}) "
                 f"tool_cap={ctx.cfg.agent.max_tool_calls} "
                 f"wall_cap={ctx.cfg.agent.max_wall_seconds}s "
                 f"turn_cap={int(ctx.cfg.agent.max_turn_seconds)}s "
@@ -861,9 +932,20 @@ def run_translator_phase2(
                 f"{ctx.cfg.agent.session_reset_after_tokens:,}t",
     )
 
+    # Build the translation graph once — reused across all sessions
+    translation_graph = build_translation_graph(ctx, bundle)
+
+    system_content = apply_prompt_cache(system_prompt, bundle.supports_prompt_caching)
     final_outcome: TranslationOutcome | None = None
     session_num = 0
     break_reason: str | None = None
+    # last_session_result is None until at least one session actually runs. It
+    # stays None on the "already done" resume path (all_terminal fires on the
+    # first iteration, before _run_one_graph_session is invoked) and on the
+    # "budget already exhausted between runs" path. Both are legitimate — we
+    # must not reference session_result unconditionally after the loop or that
+    # bare NameError kills a resume that would otherwise be a clean no-op.
+    last_session_result: GraphSessionResult | None = None
 
     while session_num < total_sessions_cap:
         session_num += 1
@@ -880,63 +962,67 @@ def run_translator_phase2(
             break
 
         ctx.events.emit("info", message=f"starting session #{session_num}")
-        initial = _build_initial_message(ctx, session_num)
+        initial_text = _build_initial_message(ctx, session_num)
+        initial_messages = [
+            SystemMessage(content=system_content),
+            HumanMessage(content=initial_text),
+        ]
 
-        outcome, reason_ended = _run_one_session(
-            ctx, client=client, system_prompt=system_prompt, tools=tools,
-            initial_message=initial, session_num=session_num,
+        last_session_result = _run_one_graph_session(
+            ctx,
+            bundle=bundle,
+            graph=translation_graph,
+            initial_messages=initial_messages,
+            session_num=session_num,
         )
-        if outcome is not None:
-            final_outcome = outcome
+        if last_session_result.outcome is not None:
+            final_outcome = last_session_result.outcome
 
-        ctx.events.emit("info", message=f"session #{session_num} ended: {reason_ended}")
+        ctx.events.emit("info", message=f"session #{session_num} ended: {last_session_result.reason}")
 
         # Terminal reasons — break the outer loop
-        if reason_ended in ("end_turn", "finish_translate",
-                            "budget_hit", "rate_limit_hard", "parse_failure"):
-            break_reason = reason_ended
+        if last_session_result.reason in ("finish_translate", "end_turn",
+                                          "budget_hit", "rate_limit_hard", "parse_failure"):
+            break_reason = last_session_result.reason
             break
         # else: "checkpoint" | "rate_limit_soft" | "exhausted" — loop again
     else:
-        # while-else: hit the total_sessions_cap without breaking
         ctx.events.emit("warn",
                         message=f"reached session cap ({total_sessions_cap}) — stopping")
         break_reason = "session_cap"
 
-    # Post-loop polish pass: if all files are terminal and compile is green
-    # but format/credo aren't, open one polish session under tool_choice="any"
-    # + the finish_polish sentinel tool. The model cannot emit pure end_turn —
-    # it must either fix warnings via edit_elixir or explicitly declare them
-    # unfixable via finish_polish(unfixable_warnings=[...]).
+    # The last session_result holds the finish_summary when the run ended via
+    # finish_translate. On the "already done" / "budget between sessions" paths
+    # no session ran, so the summary is empty.
+    phase_a_summary = last_session_result.finish_summary if last_session_result else ""
+
+    # Post-loop polish pass
     polish_sessions_used = 0
+    polish_unfixable: tuple[str, ...] = ()
     if not dry_run and _all_files_terminal(ctx):
-        tools_polish = build_tools(ctx, include_write=True, polish_mode=True)
-        polish_outcome, polish_sessions_used = _maybe_run_polish_sessions(
-            ctx, client=client, system_prompt=system_prompt,
-            tools_polish=tools_polish,
+        polish_graph = build_polish_graph(ctx, bundle)
+        polish_outcome, polish_sessions_used, polish_unfixable = _maybe_run_polish_sessions(
+            ctx,
+            bundle=bundle,
+            graph=polish_graph,
+            system_content=system_content,
             first_session_num=session_num + 1,
             session_cap=max(0, total_sessions_cap - session_num),
         )
-        session_num += polish_sessions_used
     polish_ran = polish_sessions_used > 0
 
     if final_outcome is None:
-        final_outcome = _synthesize_outcome_from_state(ctx)
-        # Not a warning under the finish_translate design — this IS the
-        # normal path. Outcome is always synthesized from disk state;
-        # `phase_a_summary` (if set) contributes the model's overview text.
-        source = "finish_translate summary + state" if ctx.phase_a_summary else "state only"
+        final_outcome = _synthesize_outcome_from_state(ctx, phase_a_summary=phase_a_summary)
+        source = "finish_translate summary + state" if phase_a_summary else "state only"
         ctx.events.emit("info", message=f"outcome synthesized ({source})")
     elif polish_ran:
-        # Polish sessions run without output_format (tool_choice="any" + a
-        # `finish_polish` sentinel supersede structured output). Re-sync
-        # validation from disk to reflect the polish session's edits.
+        # Re-sync validation from disk to reflect the polish session's edits.
         synthetic = _synthesize_outcome_from_state(ctx)
         final_outcome.validation = synthetic.validation
-        if ctx.polish_finish_unfixable:
+        if polish_unfixable:
             final_outcome.summary = (
                 final_outcome.summary
-                + f" | polish: {len(ctx.polish_finish_unfixable)} unfixable declared"
+                + f" | polish: {len(polish_unfixable)} unfixable declared"
             )[:800]
 
     ctx.events.emit(
@@ -1008,12 +1094,12 @@ def _save_polish_state(ctx: SessionContext, credo_warning_ids: set[str],
 def _maybe_run_polish_sessions(
     ctx: SessionContext,
     *,
-    client: anthropic.Anthropic,
-    system_prompt: str,
-    tools_polish: list,
+    bundle: ChatModelBundle,
+    graph: Any,
+    system_content: Any,
     first_session_num: int,
     session_cap: int,
-) -> tuple[TranslationOutcome | None, int]:
+) -> tuple[TranslationOutcome | None, int, tuple[str, ...]]:
     """Run a single polish session under `tool_choice="any"` + finish_polish.
 
     Under this configuration the model CANNOT emit pure end_turn. Every turn
@@ -1021,8 +1107,8 @@ def _maybe_run_polish_sessions(
     is `finish_polish(summary, unfixable_warnings)`. This eliminates the
     "read a couple files then quit" failure mode structurally, not via prose.
 
-    Returns (final_outcome, sessions_used). `sessions_used == 0` means no
-    polish was needed or possible (compile red / already clean).
+    Returns (final_outcome, sessions_used, finish_unfixable). `sessions_used == 0`
+    means no polish was needed or possible (compile red / already clean).
     """
     try:
         c = mix_compile(ctx.scaffold.mix_env, ctx.target_root)
@@ -1033,7 +1119,7 @@ def _maybe_run_polish_sessions(
             "warn",
             message=f"polish pre-check failed: {type(exc).__name__}: {exc} — skipping polish",
         )
-        return None, 0
+        return None, 0, ()
 
     if not c.ok:
         ctx.events.emit(
@@ -1041,11 +1127,11 @@ def _maybe_run_polish_sessions(
             message="polish skipped: mix compile is red — that's a translation "
                     "bug, not polish work",
         )
-        return None, 0
+        return None, 0, ()
     if f.ok and k.ok:
-        return None, 0
+        return None, 0, ()
     if session_cap <= 0:
-        return None, 0
+        return None, 0, ()
 
     # Skip polish when the current credo state matches a previously-declared
     # unfixable set (identical warning locations). Saves ~$0.30 and ~40s on
@@ -1062,7 +1148,7 @@ def _maybe_run_polish_sessions(
                         f"warning(s) match previously-declared unfixable set "
                         f"(state: .translate_v3_state/polish.json)",
             )
-            return None, 0
+            return None, 0, ()
 
     ctx.events.emit(
         "info",
@@ -1070,34 +1156,40 @@ def _maybe_run_polish_sessions(
                 f"format={'✓' if f.ok else '✗'} credo={'✓' if k.ok else '✗'} "
                 f"(tool_choice=any; must call finish_polish to end)",
     )
-    initial = _build_polish_message(ctx, f, k)
+    initial_text = _build_polish_message(ctx, f, k)
+    initial_messages = [
+        SystemMessage(content=system_content),
+        HumanMessage(content=initial_text),
+    ]
 
     edits_before = ctx.cost.tool_call_count("edit_elixir")
 
-    outcome, reason_ended = _run_one_session(
-        ctx, client=client, system_prompt=system_prompt, tools=tools_polish,
-        initial_message=initial, session_num=first_session_num,
+    polish_result = _run_one_graph_session(
+        ctx,
+        bundle=bundle,
+        graph=graph,
+        initial_messages=initial_messages,
+        session_num=first_session_num,
         polish_mode=True,
     )
 
     edits_made = ctx.cost.tool_call_count("edit_elixir") - edits_before
+    finish_unfixable = polish_result.finish_unfixable
     ctx.events.emit(
         "info",
-        message=f"polish session #{first_session_num} ended: {reason_ended} "
+        message=f"polish session #{first_session_num} ended: {polish_result.reason} "
                 f"(edits: {edits_made}; "
-                f"unfixable declared: {len(ctx.polish_finish_unfixable)})",
+                f"unfixable declared: {len(finish_unfixable)})",
     )
-    if ctx.polish_finish_unfixable:
-        for warn_line in ctx.polish_finish_unfixable[:20]:
-            ctx.events.emit("info", message=f"  polish left: {warn_line}")
+    for warn_line in finish_unfixable[:20]:
+        ctx.events.emit("info", message=f"  polish left: {warn_line}")
 
-    # Persist the outcome for skip-on-resume. Re-read credo — the polish
-    # session may have fixed some warnings, so pre-polish state is stale.
-    if reason_ended == "finish_polish":
+    # Persist the outcome for skip-on-resume.
+    if polish_result.reason == "finish_polish":
         try:
             k_post = mix_credo(ctx.scaffold.mix_env, ctx.target_root, strict=True)
             post_ids = _parse_credo_warnings(k_post.output)
-            _save_polish_state(ctx, post_ids, ctx.polish_finish_unfixable)
+            _save_polish_state(ctx, post_ids, finish_unfixable)
             ctx.events.emit(
                 "info",
                 message=f"polish state saved: {len(post_ids)} remaining warning(s) "
@@ -1109,10 +1201,14 @@ def _maybe_run_polish_sessions(
                 message=f"polish state save failed: {type(exc).__name__}: {exc}",
             )
 
-    return outcome, 1
+    return polish_result.outcome, 1, finish_unfixable
 
 
-def _synthesize_outcome_from_state(ctx: SessionContext) -> TranslationOutcome:
+def _synthesize_outcome_from_state(
+    ctx: SessionContext,
+    *,
+    phase_a_summary: str = "",
+) -> TranslationOutcome:
     """Build a TranslationOutcome from disk state — fallback when the model
     ends without emitting the structured summary.
 
@@ -1183,12 +1279,9 @@ def _synthesize_outcome_from_state(ctx: SessionContext) -> TranslationOutcome:
 
     # Prefer the model's own summary (from `finish_translate`) over the
     # placeholder — the model has richer context on what was interesting
-    # about this run. Falls back to placeholder text when finish_translate
+    # about this run. Falls back to placeholder when finish_translate
     # wasn't called (checkpoint, budget hit, parse_failure fallback, etc.).
-    if ctx.phase_a_summary:
-        summary_text = ctx.phase_a_summary
-    else:
-        summary_text = "synthesized from state — model did not call finish_translate"
+    summary_text = phase_a_summary or "synthesized from state — model did not call finish_translate"
 
     return TranslationOutcome(
         summary=summary_text[:800],

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Literal
 
 Severity = Literal["higher", "high", "normal", "low", "info"]
+Provider = Literal["anthropic", "openai", "ollama"]
 
 
 @dataclass(frozen=True)
@@ -45,8 +46,40 @@ class TargetConfig:
 
 
 @dataclass(frozen=True)
-class AgentConfig:
+class LLMConfig:
+    provider: Provider = "anthropic"
     model: str = "claude-opus-4-7"
+    temperature: float = 0.0
+    # Maximum tokens the model may output per turn. Anthropic default is 64 000
+    # (the current per-turn ceiling for Opus 4.7). OpenAI and Ollama interpret
+    # None as "model default", which is fine since they don't have the same
+    # thinking-token overhead concerns.
+    max_tokens: int = 64_000
+    # OpenAI-compat + Ollama. For Ollama defaults to http://localhost:11434.
+    # For OpenAI direct, leave None (uses api.openai.com). For LM Studio /
+    # vLLM / OpenRouter / any OpenAI-compatible endpoint, set the endpoint's
+    # base URL (e.g. "http://localhost:1234/v1"). Ignored by Anthropic.
+    base_url: str | None = None
+    # Ollama only. Overrides the model's default context window. Necessary
+    # for large-context Ollama runs (default is often 2048/4096 which trips
+    # HTTP 400 on our system prompt). Ignored by other providers.
+    num_ctx: int | None = None
+    # Ollama only. Caps output tokens per turn. Ignored by other providers.
+    num_predict: int | None = None
+    # OpenAI only. Reasoning-mode dial for GPT-5 family: "minimal" | "low" |
+    # "medium" | "high". Not the same axis as `agent.effort` (which drives
+    # our prompt-side effort). Ignored by other providers.
+    reasoning_effort: str | None = None
+    # Skip the "unknown model — treating as $0/token" warning for custom
+    # local models whose name doesn't match a known free-model prefix.
+    # Set for local OpenAI-compat servers (LM Studio etc.) and custom
+    # Ollama Modelfiles. Ollama provider auto-enables this behavior via
+    # prefix matching, but the escape hatch is here for edge cases.
+    cost_zero: bool = False
+
+
+@dataclass(frozen=True)
+class AgentConfig:
     model_version_policy: str = "pinned"
     # Default `medium` — translation with a detailed system prompt does NOT
     # need deep deliberation. `high` on Sonnet 4.6 caused 30-min single-turn
@@ -84,30 +117,27 @@ class ValidationConfig:
 
 
 @dataclass(frozen=True)
-class SafetyConfig:
-    task_budget_beta: bool = True
-
-
-@dataclass(frozen=True)
 class Config:
     source: SourceConfig = field(default_factory=SourceConfig)
     target: TargetConfig = field(default_factory=TargetConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
     phases: PhasesConfig = field(default_factory=PhasesConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
-    safety: SafetyConfig = field(default_factory=SafetyConfig)
 
 
-_KNOWN_TOP_LEVEL = {"source", "target", "agent", "phases", "validation", "safety"}
+_KNOWN_TOP_LEVEL = {"source", "target", "agent", "llm", "phases", "validation"}
 _KNOWN_KEYS = {
     "source": {"language", "root", "sources_glob", "tests_glob", "resources_glob"},
     "target": {"language", "root", "app_name", "module_name", "mix_deps", "dev_deps"},
-    "agent": {"model", "model_version_policy", "effort", "max_budget_tokens",
+    "agent": {"model_version_policy", "effort", "max_budget_tokens",
               "max_tool_calls", "max_wall_seconds",
-              "session_reset_after_files", "session_reset_after_tokens"},
+              "session_reset_after_files", "session_reset_after_tokens",
+              "max_turn_seconds", "thinking_budget_tokens"},
+    "llm": {"provider", "model", "temperature", "max_tokens", "base_url",
+            "num_ctx", "num_predict", "reasoning_effort", "cost_zero"},
     "phases": {"translate", "generate_tests"},
     "validation": {"run_format", "run_credo", "credo_block_severity", "run_tests"},
-    "safety": {"task_budget_beta"},
 }
 
 
@@ -156,9 +186,9 @@ def _from_toml(raw: dict) -> Config:
     src = raw.get("source", {})
     tgt = raw.get("target", {})
     agt = raw.get("agent", {})
+    llm = raw.get("llm", {})
     phs = raw.get("phases", {})
     val = raw.get("validation", {})
-    sfy = raw.get("safety", {})
 
     return Config(
         source=SourceConfig(
@@ -181,7 +211,6 @@ def _from_toml(raw: dict) -> Config:
             translate_readme=tgt.get("translate_readme", True),
         ),
         agent=AgentConfig(
-            model=agt.get("model", "claude-opus-4-7"),
             model_version_policy=agt.get("model_version_policy", "pinned"),
             effort=agt.get("effort", "medium"),
             max_budget_tokens=agt.get("max_budget_tokens", 3_000_000),
@@ -192,6 +221,17 @@ def _from_toml(raw: dict) -> Config:
             max_turn_seconds=agt.get("max_turn_seconds", 900.0),
             thinking_budget_tokens=agt.get("thinking_budget_tokens", 0),
         ),
+        llm=LLMConfig(
+            provider=llm.get("provider", "anthropic"),
+            model=llm.get("model", "claude-opus-4-7"),
+            temperature=llm.get("temperature", 0.0),
+            max_tokens=llm.get("max_tokens", 64_000),
+            base_url=llm.get("base_url"),
+            num_ctx=llm.get("num_ctx"),
+            num_predict=llm.get("num_predict"),
+            reasoning_effort=llm.get("reasoning_effort"),
+            cost_zero=llm.get("cost_zero", False),
+        ),
         phases=PhasesConfig(
             translate=phs.get("translate", True),
             generate_tests=phs.get("generate_tests", False),
@@ -201,9 +241,6 @@ def _from_toml(raw: dict) -> Config:
             run_credo=val.get("run_credo", True),
             credo_block_severity=val.get("credo_block_severity", "high"),
             run_tests=val.get("run_tests", False),
-        ),
-        safety=SafetyConfig(
-            task_budget_beta=sfy.get("task_budget_beta", True),
         ),
     )
 
@@ -249,7 +286,7 @@ def build_config(
     if module_name is not None:
         base = replace(base, target=replace(base.target, module_name=module_name))
     if model is not None:
-        base = replace(base, agent=replace(base.agent, model=model))
+        base = replace(base, llm=replace(base.llm, model=model))
     if max_budget_tokens is not None:
         base = replace(base, agent=replace(base.agent, max_budget_tokens=max_budget_tokens))
 

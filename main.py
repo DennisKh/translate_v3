@@ -16,6 +16,9 @@ import sys
 from pathlib import Path
 from typing import Literal
 
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 # Require Python 3.11 (tomllib is stdlib since 3.11)
 if sys.version_info < (3, 11):
     sys.stderr.write(
@@ -27,22 +30,22 @@ if sys.version_info < (3, 11):
 # Make sibling packages importable when this file is run directly
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import click  # noqa: E402
-import anthropic  # noqa: E402
+import click
 
-from agent.cost import CostBudget, CostReport  # noqa: E402
-from agent.events import EventStream  # noqa: E402
-from agent.session_ctx import SessionContext  # noqa: E402
-from agent.state import FileEntry, StateStore  # noqa: E402
-from agent.summary import build_and_write_summary, print_summary  # noqa: E402
-from agent.readme_translator import translate_readme  # noqa: E402
-from agent.test_writer import generate_tests  # noqa: E402
-from agent.translator import run_translator_phase2  # noqa: E402
-from language.java import discover_classes, discover_deps  # noqa: E402
-from project.config import Config, build_config  # noqa: E402
-from project.deps import build as build_dep_graph  # noqa: E402
-from project.naming import camel_to_snake  # noqa: E402
-from project.scaffold import ScaffoldResult, scaffold  # noqa: E402
+from agent.cost import CostBudget, CostReport
+from agent.events import EventStream
+from agent.llm import build_chat_model
+from agent.session_ctx import SessionContext
+from agent.state import FileEntry, StateStore
+from agent.summary import build_and_write_summary, print_summary
+from agent.readme_translator import translate_readme
+from agent.test_writer import generate_tests
+from agent.translator import run_translator_phase2
+from language.java import discover_classes, discover_deps
+from project.config import Config, build_config
+from project.deps import build as build_dep_graph
+from project.naming import camel_to_snake
+from project.scaffold import ScaffoldResult, scaffold
 
 
 def _common_package_prefix(java_classes: list) -> str:
@@ -292,7 +295,7 @@ def main(
 
     print(f"Source: {cfg.source.root}")
     print(f"Target: {cfg.target.root}")
-    print(f"Model : {cfg.agent.model} (effort={cfg.agent.effort})")
+    print(f"Model : {cfg.llm.model} (effort={cfg.agent.effort})")
     print(f"Phase : {'A ' if cfg.phases.translate else '  '}{'B' if cfg.phases.generate_tests else ' '}")
     print()
 
@@ -336,7 +339,7 @@ def main(
         # Now the state dir + observability are safe to create
         events = EventStream(state_dir / "events.jsonl", mirror_to_stdout=verbose or dry_run)
         state = StateStore(state_dir)
-        cost = CostReport(cfg.agent.model, state_dir)
+        cost = CostReport(cfg.llm.model, state_dir)
         budget = CostBudget(
             max_tokens=cfg.agent.max_budget_tokens,
             max_tool_calls=cfg.agent.max_tool_calls,
@@ -358,14 +361,12 @@ def main(
             tests_root=_resolve_tests_root(cfg),
         )
 
-        # Single API client for the run — created once, reused across Phase A,
-        # README rewriter, and Phase B. Skipped in dry-run.
-        client = anthropic.Anthropic(max_retries=3, timeout=1800.0) if not dry_run else None
+        bundle = build_chat_model(cfg)
 
         outcome = None
         if cfg.phases.translate:
-            outcome, sessions_count = run_translator_phase2(  # type: ignore[arg-type]
-                ctx, client=client, dry_run=dry_run,
+            outcome, sessions_count = run_translator_phase2(
+                ctx, bundle=bundle, dry_run=dry_run,
             )
             if outcome is not None:
                 outcome_path = state_dir / "outcome.json"
@@ -411,7 +412,7 @@ def main(
                 and validation_summary.get("compile")
                 and validation_summary.get("format")):
             try:
-                translate_readme(ctx, client=client, dry_run=dry_run)  # type: ignore[arg-type]
+                translate_readme(ctx, bundle=bundle, dry_run=dry_run)
             except Exception as exc:  # noqa: BLE001
                 # README translation is non-fatal — errors log and continue
                 events.emit("warn",
@@ -426,7 +427,7 @@ def main(
                 and validation_summary.get("compile")
                 and validation_summary.get("format")):
             try:
-                generate_tests(ctx, client=client, dry_run=dry_run)  # type: ignore[arg-type]
+                generate_tests(ctx, bundle=bundle, dry_run=dry_run)
             except Exception as exc:  # noqa: BLE001
                 # Phase B is non-fatal — errors log and continue
                 events.emit("warn",
