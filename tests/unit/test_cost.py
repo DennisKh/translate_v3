@@ -140,7 +140,8 @@ def test_budget_status_flags_cost_exhaustion():
     b.add_usage(TurnUsage(output_tokens=5000), "claude-opus-4-7")
     reason = b.status()
     assert reason is not None
-    assert "cost cap" in reason
+    assert reason.type == "max_cost"
+    assert "cost cap" in reason.reason
 
 
 def test_budget_status_flags_tool_call_cap():
@@ -149,7 +150,8 @@ def test_budget_status_flags_tool_call_cap():
     b.add(tool_calls=6)
     reason = b.status()
     assert reason is not None
-    assert "tool-call" in reason
+    assert reason.type == "max_tool"
+    assert "tool-call" in reason.reason
 
 
 def test_budget_add_usage_counts_dollars_not_raw_tokens():
@@ -177,7 +179,8 @@ def test_budget_add_usage_caps_on_real_cost():
     b.add_usage(TurnUsage(output_tokens=100_000), "claude-opus-4-7")
     reason = b.status()
     assert reason is not None
-    assert "cost cap" in reason
+    assert reason.type == "max_cost"
+    assert "cost cap" in reason.reason
 
 
 def test_cost_report_model_is_public_property(tmp_path):
@@ -259,3 +262,37 @@ def test_cost_zero_false_still_warns_for_truly_unknown_model():
         warnings.simplefilter("always")
         pricing_for("really-truly-unknown-model-xyz", cost_zero=False)
     assert any("unknown model" in str(x.message) for x in w)
+
+
+def test_extend_wall_seconds_grows_cap():
+    b = CostBudget(max_tokens=1_000_000, max_tool_calls=100, max_wall_seconds=3600)
+    b.extend_wall_seconds(1800)
+    assert b.max_wall_seconds == 5400
+
+
+def test_extend_wall_seconds_ignores_zero_and_negative():
+    b = CostBudget(max_tokens=1_000_000, max_tool_calls=100, max_wall_seconds=3600)
+    b.extend_wall_seconds(0)
+    b.extend_wall_seconds(-100)
+    assert b.max_wall_seconds == 3600
+
+
+def test_remove_wall_cap_sets_to_sys_maxsize():
+    import sys
+    b = CostBudget(max_tokens=1_000_000, max_tool_calls=100, max_wall_seconds=3600)
+    b.remove_wall_cap()
+    assert b.max_wall_seconds == sys.maxsize
+    # And status() no longer flags wall.
+    b.start()
+    assert b.status() is None
+
+
+def test_elapsed_seconds_zero_before_start():
+    b = CostBudget(max_tokens=1_000_000, max_tool_calls=100, max_wall_seconds=3600)
+    assert b.elapsed_seconds() == 0
+
+
+def test_elapsed_seconds_after_start_is_nonnegative():
+    b = CostBudget(max_tokens=1_000_000, max_tool_calls=100, max_wall_seconds=3600)
+    b.start()
+    assert b.elapsed_seconds() >= 0

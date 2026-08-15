@@ -256,7 +256,9 @@ def test_process_agent_chunk_anthropic_no_tool_calls_terminates_immediately(tmp_
 
 def test_process_agent_chunk_hard_budget_cap_terminates(tmp_path):
     """budget.status() returns non-None → terminate with budget_hit."""
-    ctx = _fake_ctx(tmp_path, budget_status="cost cap reached ($10)")
+    from agent.cost import CostBudget
+    status = CostBudget.StatusResult(type="max_cost", reason="cost cap reached ($10)")
+    ctx = _fake_ctx(tmp_path, budget_status=status)
     stats = _stats()
     ai = _ai_with_calls()
 
@@ -266,6 +268,7 @@ def test_process_agent_chunk_hard_budget_cap_terminates(tmp_path):
     )
     assert action.terminate is not None
     assert action.terminate.reason == "budget_hit"
+    assert action.terminate.cap_type == "max_cost"
 
 
 def test_process_agent_chunk_records_turn_usage(tmp_path):

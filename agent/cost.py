@@ -15,11 +15,12 @@ Two-tier model pricing:
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 import warnings
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -145,6 +146,12 @@ class CostBudget:
     # Derived at __post_init__ from max_tokens using worst-case Opus pricing
     _max_cost_usd: float = 0.0
 
+    from typing import NamedTuple
+
+    class StatusResult(NamedTuple):
+        type: str
+        reason: str
+
     def __post_init__(self) -> None:
         # Approximate cost cap. Users think in tokens historically; we translate.
         # Worst case: max_tokens as pure output at Opus 4.7 rate ($25/M).
@@ -178,17 +185,46 @@ class CostBudget:
             return 100.0
         return max(0.0, 100.0 * (1.0 - self.total_cost_usd / self._max_cost_usd))
 
-    def status(self) -> str | None:
+    def status(self) -> StatusResult | None:
         """Return None if fine, else a reason string for a soft-stop."""
         if self.total_cost_usd >= self._max_cost_usd:
-            return (f"cost cap reached (${self.total_cost_usd:.2f} / ${self._max_cost_usd:.2f}) — "
+            reason = (f"cost cap reached (${self.total_cost_usd:.2f} / ${self._max_cost_usd:.2f}) — "
                     f"raise --max-budget-tokens if intentional")
+            return self.StatusResult(reason=reason, type="max_cost")
         if self.total_tool_calls >= self.max_tool_calls:
-            return f"tool-call cap reached ({self.total_tool_calls}/{self.max_tool_calls})"
+            reason = f"tool-call cap reached ({self.total_tool_calls}/{self.max_tool_calls})"
+            return self.StatusResult(reason=reason, type="max_tool")
         wall = time.monotonic() - self.started_at
         if wall >= self.max_wall_seconds:
-            return f"wall-clock cap reached ({int(wall)}s/{self.max_wall_seconds}s)"
+            reason = f"wall-clock cap reached ({int(wall)}s/{self.max_wall_seconds}s)"
+            return self.StatusResult(reason=reason, type="max_wall")
         return None
+
+    def elapsed_seconds(self) -> int:
+        """Wall-clock seconds since `start()` was called."""
+        if self.started_at <= 0:
+            return 0
+        return int(time.monotonic() - self.started_at)
+
+    def extend_wall_seconds(self, delta_seconds: int) -> None:
+        """Grow the wall-clock cap by `delta_seconds`.
+
+        Used by the HITL "extend" action. Extending the cap (rather than
+        resetting `started_at`) preserves the elapsed reporting so subsequent
+        cap-hit messages remain intelligible ("2h 3m / 2h 0m").
+        """
+        if delta_seconds <= 0:
+            return
+        self.max_wall_seconds += delta_seconds
+
+    def remove_wall_cap(self) -> None:
+        """Remove the wall-clock cap for the remainder of the run.
+
+        Sets `max_wall_seconds` to `sys.maxsize` so `status()`'s existing
+        comparison keeps working with no branch. Used by the HITL "continue
+        indefinitely" action.
+        """
+        self.max_wall_seconds = sys.maxsize
 
 
 class CostReport:

@@ -47,6 +47,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from pydantic import BaseModel, Field
 
 from agent.graph import AgentState, build_polish_graph, build_translation_graph
+from agent.hitl import WallCapAction, prompt_wall_cap_action
 from agent.llm import (
     ChatModelBundle,
     ExceptionKind,
@@ -109,6 +110,11 @@ _BUDGET_WARN_PCT = 90.0
 
 # Nudge the agent to compile after this many writes without one
 _COMPILE_NUDGE_THRESHOLD = 5
+
+# HITL: fixed extension size when the user picks "[e] extend" at the
+# wall-cap prompt. 30 minutes. Not user-configurable — see REVIEW_HITL.md
+# for rationale (a numeric-input UI has negligible upside).
+_HITL_WALL_EXTENSION_SECONDS = 30 * 60
 
 # Heartbeat interval — while waiting for the next model turn, log "still
 # waiting" every N seconds so the user can distinguish "long generation in
@@ -482,6 +488,7 @@ class GraphSessionResult(NamedTuple):
     reason: str
     finish_summary: str
     finish_unfixable: tuple[str, ...]
+    cap_type: str | None = None
 
 
 class _ChunkAction(NamedTuple):
@@ -601,11 +608,11 @@ def _process_agent_chunk(
         )
         return _ChunkAction(terminate=GraphSessionResult(None, "end_turn", "", ()))
 
-    # Hard budget cap — stop the run entirely. Returns immediately (no
-    # injection) — safe from any message branch.
-    if reason := ctx.budget.status():
-        ctx.events.emit("warn", message=f"cap reached: {reason}")
-        return _ChunkAction(terminate=GraphSessionResult(None, "budget_hit", "", ()))
+    if result := ctx.budget.status():
+        ctx.events.emit("warn", message=f"cap reached: {result.reason}")
+        return _ChunkAction(terminate=GraphSessionResult(
+            None, "budget_hit", "", (), cap_type=result.type,
+        ))
 
     # Session-reset checkpoint — main-mode only. Returns immediately (starts
     # a fresh session), so the pending tool_calls in this AIMessage are never
@@ -871,11 +878,76 @@ def _run_one_graph_session(
                 message=f"session {session_num} graph stream ended without sentinel",
             )
             return GraphSessionResult(None, "exhausted", "", ())
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _handle_stream_exception(ctx, exc, session_num)
     finally:
         if polish_mode:
             ctx.polish_active = False
+
+
+# ---------------------------------------------------------------------------
+# HITL — wall-cap prompt dispatch
+# ---------------------------------------------------------------------------
+
+def _handle_wall_cap_hitl(ctx: SessionContext) -> bool:
+    """Prompt the user on wall-cap hit. Return True if the run should continue.
+
+    Returns False (caller falls through to the normal budget_hit exit) when:
+      - `cfg.agent.hitl_on_wall_cap` is False
+      - stdin is not a TTY (auto-downgrade)
+      - user picks [a] abort, empty input, EOF, timeout, or invalid input
+
+    Returns True (caller `continue`s the outer loop) when:
+      - user picks [e] extend: cap grows by 30 min
+      - user picks [c] continue: cap set to sys.maxsize (effectively removed)
+
+    State is flushed to disk (`ctx.cost.persist()`) before the prompt so a
+    user who aborts (or times out) sees the same on-disk state as if HITL
+    had never been offered — `--resume` behavior is unaffected.
+    """
+    if not ctx.cfg.agent.hitl_on_wall_cap:
+        ctx.events.emit(
+            "info",
+            message="wall-cap hit; HITL prompt disabled by config — exiting",
+        )
+        return False
+
+    # Persist state before we block on input. If the user walks away and
+    # times out we still want cost_report.json to reflect what was spent.
+    ctx.cost.persist()
+
+    action = prompt_wall_cap_action(
+        elapsed_seconds=ctx.budget.elapsed_seconds(),
+        cap_seconds=ctx.budget.max_wall_seconds,
+        files_done=_count_terminal(ctx),
+        files_total=len(ctx.state.all()),
+        cost_usd=ctx.cost.cumulative_cost_usd(),
+    )
+
+    if action == WallCapAction.EXTEND:
+        ctx.budget.extend_wall_seconds(_HITL_WALL_EXTENSION_SECONDS)
+        ctx.events.emit(
+            "info",
+            message=f"HITL: wall cap extended by "
+                    f"{_HITL_WALL_EXTENSION_SECONDS // 60} min "
+                    f"(new cap {ctx.budget.max_wall_seconds}s)",
+        )
+        return True
+
+    if action == WallCapAction.CONTINUE:
+        ctx.budget.remove_wall_cap()
+        ctx.events.emit(
+            "info",
+            message="HITL: wall cap removed for the remainder of the run",
+        )
+        return True
+
+    # ABORT — includes non-TTY auto-downgrade, empty input, EOF, timeout.
+    ctx.events.emit(
+        "info",
+        message="HITL: aborting on wall-cap (user choice, non-TTY, or timeout)",
+    )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -957,9 +1029,9 @@ def run_translator_phase2(
                             message=f"all {len(ctx.state.all())} files in terminal states — done")
             break_reason = "all_terminal"
             break
-        if reason := ctx.budget.status():
+        if result := ctx.budget.status():
             ctx.events.emit("warn",
-                            message=f"budget cap reached before session {session_num}: {reason}")
+                            message=f"budget cap reached before session {session_num}: {result.reason}")
             break_reason = "budget_hit_between_sessions"
             break
 
@@ -981,6 +1053,11 @@ def run_translator_phase2(
             final_outcome = last_session_result.outcome
 
         ctx.events.emit("info", message=f"session #{session_num} ended: {last_session_result.reason}")
+
+        if (last_session_result.reason == "budget_hit"
+                and last_session_result.cap_type == "max_wall"
+                and _handle_wall_cap_hitl(ctx)):
+            continue
 
         # Terminal reasons — break the outer loop
         if last_session_result.reason in ("finish_translate", "end_turn",
@@ -1113,24 +1190,29 @@ def _maybe_run_polish_sessions(
     means no polish was needed or possible (compile red / already clean).
     """
     try:
-        c = mix_compile(ctx.scaffold.mix_env, ctx.target_root)
+        c_real = mix_compile(ctx.scaffold.mix_env, ctx.target_root,
+                             warnings_as_errors=False)
+        c_strict = mix_compile(ctx.scaffold.mix_env, ctx.target_root,
+                               warnings_as_errors=True)
         f = mix_format(ctx.scaffold.mix_env, ctx.target_root, check_only=True)
         k = mix_credo(ctx.scaffold.mix_env, ctx.target_root, strict=True)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         ctx.events.emit(
             "warn",
             message=f"polish pre-check failed: {type(exc).__name__}: {exc} — skipping polish",
         )
         return None, 0, ()
 
-    if not c.ok:
+    if not c_real.ok:
+        # Real compile errors (syntax, unresolved references) — not polish work.
         ctx.events.emit(
             "warn",
-            message="polish skipped: mix compile is red — that's a translation "
-                    "bug, not polish work",
+            message="polish skipped: real compile errors present (not just warnings) "
+                    "— this is a translation bug, fix it before polish",
         )
         return None, 0, ()
-    if f.ok and k.ok:
+    if f.ok and k.ok and c_strict.ok:
+        # Nothing for polish to do.
         return None, 0, ()
     if session_cap <= 0:
         return None, 0, ()
@@ -1197,7 +1279,7 @@ def _maybe_run_polish_sessions(
                 message=f"polish state saved: {len(post_ids)} remaining warning(s) "
                         f"(future resumes will skip polish if credo state is unchanged)",
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             ctx.events.emit(
                 "warn",
                 message=f"polish state save failed: {type(exc).__name__}: {exc}",
@@ -1265,7 +1347,7 @@ def _synthesize_outcome_from_state(
                         f"format={'✓' if f.ok else '✗'} "
                         f"credo={'✓' if k.ok else '✗'}",
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             ctx.events.emit(
                 "warn",
                 message=f"synthesized validation check failed: "

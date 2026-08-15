@@ -100,6 +100,8 @@ class AgentConfig:
     # instead of adaptive when set. Prevents runaway deliberation.
     # 0 = keep adaptive (no cap); >0 = hard cap in tokens.
     thinking_budget_tokens: int = 0
+    # Set False to skip the prompt in scripted runs that share a TTY.
+    hitl_on_wall_cap: bool = True
 
 
 @dataclass(frozen=True)
@@ -133,7 +135,8 @@ _KNOWN_KEYS = {
     "agent": {"model_version_policy", "effort", "max_budget_tokens",
               "max_tool_calls", "max_wall_seconds",
               "session_reset_after_files", "session_reset_after_tokens",
-              "max_turn_seconds", "thinking_budget_tokens"},
+              "max_turn_seconds", "thinking_budget_tokens",
+              "hitl_on_wall_cap"},
     "llm": {"provider", "model", "temperature", "max_tokens", "base_url",
             "num_ctx", "num_predict", "reasoning_effort", "cost_zero"},
     "phases": {"translate", "generate_tests"},
