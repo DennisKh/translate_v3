@@ -312,10 +312,12 @@ def _build_polish_message(
     credo_result: Any,
 ) -> str:
     """Seed message for a polish session — fires when all files are terminal
-    but `mix format --check` or `mix credo --strict` is still red.
+    but `mix format --check`, `mix credo --strict`, or
+    `mix compile --warnings-as-errors` is still red.
 
-    Compile is assumed green here (guarded upstream). Polish targets style-only
-    fixups the agent left behind when translating.
+    Real compile errors (unresolved symbols, syntax) are blocked upstream.
+    Warnings promoted to errors by --warnings-as-errors are polish territory
+    and may still be present when this message is generated.
 
     The polish session runs under `tool_choice="any"`: the model MUST call a
     tool every turn. The ONLY way to end the session is `finish_polish(...)`.
