@@ -56,6 +56,7 @@ from agent.llm import (
     turn_usage_from_ai_message,
 )
 from agent.mix_ops import mix_compile, mix_credo, mix_format
+from agent.observability import build_graph_config, build_langfuse_handler
 from agent.session_ctx import SessionContext
 from agent.state import FileState
 
@@ -778,6 +779,7 @@ def _run_one_graph_session(
     initial_messages: list,
     session_num: int,
     polish_mode: bool = False,
+    graph_config: dict[str, Any] | None = None,
 ) -> GraphSessionResult:
     """Run one LangGraph session. Returns GraphSessionResult(outcome, reason, finish_summary, finish_unfixable).
 
@@ -833,7 +835,10 @@ def _run_one_graph_session(
             action = _CONTINUE
 
             try:
-                for chunk in graph.stream(state, stream_mode="values"):
+                stream_kwargs: dict[str, Any] = {"stream_mode": "values"}
+                if graph_config is not None:
+                    stream_kwargs["config"] = graph_config
+                for chunk in graph.stream(state, **stream_kwargs):
                     last_chunk = chunk
                     last_msg = chunk["messages"][-1] if chunk["messages"] else None
                     if last_msg is None:
@@ -1009,6 +1014,25 @@ def run_translator_phase2(
     # Build the translation graph once — reused across all sessions
     translation_graph = build_translation_graph(ctx, bundle)
 
+    # Optional Langfuse tracing. Handler is None unless
+    # cfg.langfuse.enabled=true AND the LANGFUSE_* env vars are present.
+    langfuse_handler = build_langfuse_handler(ctx.cfg)
+    langfuse_session_id: str | None = None
+    trace_metadata: dict[str, Any] = {}
+    if langfuse_handler is not None:
+        langfuse_session_id = ctx.scaffold.target_root.name
+        trace_metadata = {
+            "provider": getattr(ctx.cfg.llm, "provider", None),
+            "model": getattr(ctx.cfg.llm, "model", None),
+            "source_root": (str(ctx.cfg.source.root)
+                            if getattr(ctx.cfg.source, "root", None) else None),
+            "target_root": str(ctx.scaffold.target_root),
+        }
+        ctx.events.emit(
+            "info",
+            message=f"langfuse tracing on (session_id={langfuse_session_id})",
+        )
+
     system_content = apply_prompt_cache(system_prompt, bundle.supports_prompt_caching)
     final_outcome: TranslationOutcome | None = None
     session_num = 0
@@ -1048,6 +1072,14 @@ def run_translator_phase2(
             graph=translation_graph,
             initial_messages=initial_messages,
             session_num=session_num,
+            graph_config=build_graph_config(
+                langfuse_handler,
+                run_name=f"translate/session-{session_num}",
+                metadata={**trace_metadata, "session_num": session_num,
+                          "phase": "translate"},
+                session_id=langfuse_session_id,
+                tags=["translate_v3", "translate"],
+            ),
         )
         if last_session_result.outcome is not None:
             final_outcome = last_session_result.outcome
@@ -1087,6 +1119,9 @@ def run_translator_phase2(
             system_content=system_content,
             first_session_num=session_num + 1,
             session_cap=max(0, total_sessions_cap - session_num),
+            langfuse_handler=langfuse_handler,
+            langfuse_session_id=langfuse_session_id,
+            trace_metadata=trace_metadata,
         )
     polish_ran = polish_sessions_used > 0
 
@@ -1178,6 +1213,9 @@ def _maybe_run_polish_sessions(
     system_content: Any,
     first_session_num: int,
     session_cap: int,
+    langfuse_handler: Any | None = None,
+    langfuse_session_id: str | None = None,
+    trace_metadata: dict[str, Any] | None = None,
 ) -> tuple[TranslationOutcome | None, int, tuple[str, ...]]:
     """Run a single polish session under `tool_choice="any"` + finish_polish.
 
@@ -1255,6 +1293,15 @@ def _maybe_run_polish_sessions(
         initial_messages=initial_messages,
         session_num=first_session_num,
         polish_mode=True,
+        graph_config=build_graph_config(
+            langfuse_handler,
+            run_name=f"polish/session-{first_session_num}",
+            metadata={**(trace_metadata or {}),
+                      "session_num": first_session_num,
+                      "phase": "polish"},
+            session_id=langfuse_session_id,
+            tags=["translate_v3", "polish"],
+        ),
     )
 
     edits_made = ctx.cost.tool_call_count("edit_elixir") - edits_before

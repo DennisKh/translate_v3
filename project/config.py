@@ -119,6 +119,13 @@ class ValidationConfig:
 
 
 @dataclass(frozen=True)
+class LangfuseConfig:
+    enabled: bool = False
+    # 0.0–1.0 sampling rate for traces. 1.0 = capture everything.
+    sample_rate: float = 1.0
+
+
+@dataclass(frozen=True)
 class Config:
     source: SourceConfig = field(default_factory=SourceConfig)
     target: TargetConfig = field(default_factory=TargetConfig)
@@ -126,9 +133,10 @@ class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     phases: PhasesConfig = field(default_factory=PhasesConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+    langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
 
 
-_KNOWN_TOP_LEVEL = {"source", "target", "agent", "llm", "phases", "validation"}
+_KNOWN_TOP_LEVEL = {"source", "target", "agent", "llm", "phases", "validation", "langfuse"}
 _KNOWN_KEYS = {
     "source": {"language", "root", "sources_glob", "tests_glob", "resources_glob"},
     "target": {"language", "root", "app_name", "module_name", "mix_deps", "dev_deps"},
@@ -141,6 +149,7 @@ _KNOWN_KEYS = {
             "num_ctx", "num_predict", "reasoning_effort", "cost_zero"},
     "phases": {"translate", "generate_tests"},
     "validation": {"run_format", "run_credo", "credo_block_severity", "run_tests"},
+    "langfuse": {"enabled", "sample_rate"},
 }
 
 
@@ -192,6 +201,7 @@ def _from_toml(raw: dict) -> Config:
     llm = raw.get("llm", {})
     phs = raw.get("phases", {})
     val = raw.get("validation", {})
+    lfs = raw.get("langfuse", {})
 
     return Config(
         source=SourceConfig(
@@ -244,6 +254,10 @@ def _from_toml(raw: dict) -> Config:
             run_credo=val.get("run_credo", True),
             credo_block_severity=val.get("credo_block_severity", "high"),
             run_tests=val.get("run_tests", False),
+        ),
+        langfuse=LangfuseConfig(
+            enabled=lfs.get("enabled", False),
+            sample_rate=lfs.get("sample_rate", 1.0),
         ),
     )
 

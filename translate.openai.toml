@@ -18,12 +18,15 @@ provider = "openai"
 # gpt-5-mini — cheap and fast, good for smoke tests. Alternatives:
 # - "gpt-5"           — full frontier model; ~5-10x cost, best quality
 # - "gpt-4o-mini"     — older, cheapest option (~$0.05-0.15 for fast-uuid)
-model = "gpt-5"
+model = "gpt-5-mini"
 temperature = 0.0
 max_tokens = 64000              # OpenAI has smaller per-response caps than Anthropic
-reasoning_effort = "medium"   # GPT-5 only: "minimal" | "low" | "medium" | "high"
+# reasoning_effort = "medium"   # GPT-5 only: "minimal" | "low" | "medium" | "high"
 # base_url = "https://openrouter.ai/api/v1"  # or LM Studio / vLLM / OpenRouter — see translate.lmstudio.toml
 
 [agent]
 max_wall_seconds = 10800
 max_tool_calls = 500
+
+[langfuse]
+enabled = true
